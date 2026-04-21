@@ -1,21 +1,15 @@
-// =============================================
-// SERVER.JS – Express API + sincronização
-// Ponto de entrada principal do backend
-// =============================================
-
 'use strict';
 
 require('dotenv').config();
 
 const express = require('express');
 const cors = require('cors');
-const { testConnections, localPool, empresaPool } = require('./db');
-const { startSync, getSyncStats } = require('./sync');
+const { testConnection, dbPool } = require('./db');
+const { startSync, getSyncStats, runSync } = require('./sync');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
-// ── Middlewares ───────────────────────────────────────────
 app.use(express.json());
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
@@ -23,17 +17,11 @@ app.use(cors({
   allowedHeaders: ['Content-Type', 'Authorization'],
 }));
 
-// ── Helpers ───────────────────────────────────────────────
 function sendError(res, status, message, detail) {
   return res.status(status).json({ ok: false, error: message, detail: detail || null });
 }
 
-// ═══════════════════════════════════════════════════════════
-//  ROTAS
-// ═══════════════════════════════════════════════════════════
-
-// ── GET /health ───────────────────────────────────────────
-// Verifica se o servidor está de pé
+// health
 app.get('/health', (req, res) => {
   res.json({
     ok: true,
@@ -44,12 +32,10 @@ app.get('/health', (req, res) => {
   });
 });
 
-// ── GET /api/clientes ─────────────────────────────────────
-// Retorna todos os clientes do ERP
-// Pensado para a tela administrativa do app
+// clientes
 app.get('/api/clientes', async (req, res) => {
   try {
-    const [rows] = await empresaPool.query(`
+    const [rows] = await dbPool.query(`
       SELECT
         cli_codigo,
         cli_nome,
@@ -67,21 +53,13 @@ app.get('/api/clientes', async (req, res) => {
       total: rows.length,
       data: rows,
     });
-
   } catch (err) {
     console.error('GET /api/clientes erro:', err.message);
     sendError(res, 500, 'Erro ao buscar clientes', err.message);
   }
 });
 
-// ── GET /api/producao ─────────────────────────────────────
-// Retorna todos os lotes da tabela producao_lotes
-// Query params opcionais:
-//   ?status=aguardando        → filtra por status
-//   ?setor=moagem             → filtra por setor_atual
-//   ?limit=100                → máx de registros (padrão 500)
-//   ?offset=0                 → paginação
-//   ?search=texto             → busca em cliente_nome / produto_nome / numero_pedido
+// produção
 app.get('/api/producao', async (req, res) => {
   try {
     const limit = Math.min(Number(req.query.limit) || 500, 2000);
@@ -104,22 +82,21 @@ app.get('/api/producao', async (req, res) => {
     }
 
     if (search) {
-      conditions.push('(cliente_nome LIKE ? OR produto_nome LIKE ? OR pedido_numero LIKE ?)');
+      conditions.push('(cliente_nome LIKE ? OR produto_nome LIKE ? OR numero_pedido LIKE ?)');
       params.push(search, search, search);
     }
 
-    const where = conditions.length > 0
-      ? 'WHERE ' + conditions.join(' AND ')
-      : '';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
-    const [[{ total }]] = await localPool.query(
+    const [[{ total }]] = await dbPool.query(
       `SELECT COUNT(*) AS total FROM producao_lotes ${where}`,
       params
     );
 
-    const [rows] = await localPool.query(
-      `SELECT * FROM producao_lotes ${where}
-       ORDER BY criado_em DESC
+    const [rows] = await dbPool.query(
+      `SELECT * FROM producao_lotes
+       ${where}
+       ORDER BY data_criacao DESC
        LIMIT ? OFFSET ?`,
       [...params, limit, offset]
     );
@@ -131,36 +108,31 @@ app.get('/api/producao', async (req, res) => {
       offset,
       data: rows,
     });
-
   } catch (err) {
     console.error('GET /api/producao erro:', err.message);
     sendError(res, 500, 'Erro ao buscar lotes', err.message);
   }
 });
 
-// ── GET /api/producao/:id ─────────────────────────────────
-// Retorna um lote pelo ID
+// lote por id
 app.get('/api/producao/:id', async (req, res) => {
   try {
-    const [rows] = await localPool.query(
+    const [rows] = await dbPool.query(
       'SELECT * FROM producao_lotes WHERE id = ? LIMIT 1',
       [req.params.id]
     );
 
-    if (rows.length === 0) {
+    if (!rows.length) {
       return sendError(res, 404, 'Lote não encontrado');
     }
 
     res.json({ ok: true, data: rows[0] });
-
   } catch (err) {
     sendError(res, 500, 'Erro ao buscar lote', err.message);
   }
 });
 
-// ── PATCH /api/producao/:id ───────────────────────────────
-// Atualiza status e/ou setor_atual de um lote
-// Body: { status?: string, setor_atual?: string }
+// atualizar lote
 app.patch('/api/producao/:id', async (req, res) => {
   try {
     const { status, setor_atual } = req.body || {};
@@ -184,39 +156,35 @@ app.patch('/api/producao/:id', async (req, res) => {
 
     params.push(req.params.id);
 
-    const [result] = await localPool.query(
+    const [result] = await dbPool.query(
       `UPDATE producao_lotes SET ${fields.join(', ')} WHERE id = ?`,
       params
     );
 
-    if (result.affectedRows === 0) {
+    if (!result.affectedRows) {
       return sendError(res, 404, 'Lote não encontrado');
     }
 
-    const [rows] = await localPool.query(
+    const [rows] = await dbPool.query(
       'SELECT * FROM producao_lotes WHERE id = ? LIMIT 1',
       [req.params.id]
     );
 
     res.json({ ok: true, data: rows[0] });
-
   } catch (err) {
     console.error('PATCH /api/producao/:id erro:', err.message);
     sendError(res, 500, 'Erro ao atualizar lote', err.message);
   }
 });
 
-// ── GET /api/sync/status ──────────────────────────────────
-// Retorna estatísticas da sincronização
+// sync status
 app.get('/api/sync/status', (req, res) => {
   res.json({ ok: true, ...getSyncStats() });
 });
 
-// ── POST /api/sync/run ────────────────────────────────────
-// Dispara uma sincronização manual imediata
+// sync manual
 app.post('/api/sync/run', async (req, res) => {
   try {
-    const { runSync } = require('./sync');
     const result = await runSync();
     res.json({ ok: true, ...result });
   } catch (err) {
@@ -224,41 +192,32 @@ app.post('/api/sync/run', async (req, res) => {
   }
 });
 
-// ── 404 genérico ──────────────────────────────────────────
 app.use((req, res) => {
   sendError(res, 404, `Rota não encontrada: ${req.method} ${req.path}`);
 });
 
-// ═══════════════════════════════════════════════════════════
-//  INICIALIZAÇÃO
-// ═══════════════════════════════════════════════════════════
 (async () => {
   try {
     console.log('\n╔══════════════════════════════════════════════╗');
     console.log('║   FactoryFlow  –  MySQL Bridge  v1.0.0      ║');
     console.log('╚══════════════════════════════════════════════╝\n');
 
-    // 1. Testa conexões com os dois bancos
-    await testConnections();
+    await testConnection();
 
-    // 2. Inicia o servidor HTTP
     app.listen(PORT, () => {
-      console.log(`\n🚀  API rodando em http://localhost:${PORT}`);
-      console.log(`    GET  /api/clientes         → lista clientes ERP`);
-      console.log(`    GET  /api/producao         → lista lotes`);
-      console.log(`    GET  /api/producao/:id     → detalhe do lote`);
-      console.log(`    PATCH /api/producao/:id    → atualiza status/setor`);
-      console.log(`    POST /api/sync/run         → sync manual`);
-      console.log(`    GET  /api/sync/status      → estatísticas`);
-      console.log(`    GET  /health               → health check\n`);
+      console.log(`\n🚀 API rodando em http://localhost:${PORT}`);
+      console.log(`   GET  /api/clientes`);
+      console.log(`   GET  /api/producao`);
+      console.log(`   GET  /api/producao/:id`);
+      console.log(`   PATCH /api/producao/:id`);
+      console.log(`   POST /api/sync/run`);
+      console.log(`   GET  /api/sync/status`);
+      console.log(`   GET  /health\n`);
     });
 
-    // 3. Inicia o loop de sincronização automática
-    // startSync();
-
+    startSync();
   } catch (err) {
-    console.error('\n💥  Falha na inicialização:', err.message);
-    console.error('    Verifique o arquivo .env, o db.js e as conexões de banco.\n');
+    console.error('\n💥 Falha na inicialização:', err.message);
     process.exit(1);
   }
 })();
