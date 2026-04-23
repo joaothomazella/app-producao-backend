@@ -54,21 +54,22 @@ app.get('/', (req, res) => {
     service: 'FactoryFlow + CQVision API',
     version: '2.0.0',
     timestamp: new Date().toISOString(),
-    endpoints: [
-      'GET /health',
-      'GET /api/stats',
-      'GET /api/clientes',
-      'GET /api/pedidos',
-      'GET /api/pedidos/:numero',
-      'GET /api/ops',
-      'GET /api/ops/:op',
-      'GET /api/producao',
-      'GET /api/producao/:id',
-      'PATCH /api/producao/:id',
-      'GET /api/cq/lotes/:op',
-      'GET /api/sync/status',
-      'POST /api/sync/run'
-    ],
+  endpoints: [
+  'GET /health',
+  'GET /api/stats',
+  'GET /api/clientes',
+  'GET /api/pedidos',
+  'GET /api/pedidos/:numero',
+  'GET /api/ops',
+  'GET /api/ops/:op',
+  'GET /api/producao',
+  'GET /api/producao/:id',
+  'PATCH /api/producao/:id',
+  'GET /api/cq/lotes/:op',
+  'GET /api/cq/lote-resumo/:op',
+  'GET /api/sync/status',
+  'POST /api/sync/run'
+],
   });
 });
 
@@ -720,6 +721,65 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
   }
 });
 
+// CQ VISION - resumo limpo (novo endpoint)
+app.get('/api/cq/lote-resumo/:op', async (req, res) => {
+  try {
+    const { op } = req.params;
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          p.pits_op,
+          p.pits_numero,
+          p.pits_cliente,
+          c.cli_nome AS nome_cliente,
+          p.pits_previsao,
+          p.pits_produto,
+          p.pits_nome_produto,
+          p.pits_qtde,
+          p.pits_peso,
+          p.pits_revisao,
+          p.pits_viscosidade,
+          p.pits_densidade,
+          p.pits_fineza
+        FROM cli_pedidos_itens p
+        LEFT JOIN cli_clientes c
+          ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+        WHERE p.pits_op = ?
+        LIMIT 1
+      `,
+      [op]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 404, 'Lote não encontrado');
+    }
+
+    const row = rows[0];
+
+    res.json({
+      ok: true,
+      data: {
+        op: row.pits_op,
+        pedido: row.pits_numero,
+        cliente_codigo: row.pits_cliente,
+        cliente_nome: row.nome_cliente,
+        previsao: row.pits_previsao,
+        produto_codigo: row.pits_produto,
+        produto_nome: row.pits_nome_produto,
+        quantidade: row.pits_qtde,
+        peso: row.pits_peso,
+        revisao: row.pits_revisao,
+        viscosidade_padrao: row.pits_viscosidade,
+        densidade_padrao: row.pits_densidade,
+        fineza_padrao: row.pits_fineza
+      }
+    });
+  } catch (err) {
+    console.error('GET /api/cq/lote-resumo/:op erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar resumo do lote', err.message);
+  }
+});
 // =========================
 // SYNC
 // =========================
@@ -779,6 +839,7 @@ app.use((req, res) => {
       console.log('   GET  /api/producao/:id');
       console.log('   PATCH /api/producao/:id');
       console.log('   GET  /api/cq/lotes/:op');
+      console.log('   GET  /api/cq/lote-resumo/:op');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
     });
