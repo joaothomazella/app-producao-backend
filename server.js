@@ -54,22 +54,25 @@ app.get('/', (req, res) => {
     service: 'FactoryFlow + CQVision API',
     version: '2.0.0',
     timestamp: new Date().toISOString(),
-  endpoints: [
-  'GET /health',
-  'GET /api/stats',
-  'GET /api/clientes',
-  'GET /api/pedidos',
-  'GET /api/pedidos/:numero',
-  'GET /api/ops',
-  'GET /api/ops/:op',
-  'GET /api/producao',
-  'GET /api/producao/:id',
-  'PATCH /api/producao/:id',
-  'GET /api/cq/lotes/:op',
-  'GET /api/cq/lote-resumo/:op',
-  'GET /api/sync/status',
-  'POST /api/sync/run'
-],
+    endpoints: [
+      'GET /health',
+      'GET /api/stats',
+      'GET /api/clientes',
+      'GET /api/materias-primas/:codigo',
+      'GET /api/pedidos',
+      'GET /api/pedidos/:numero',
+      'GET /api/ops',
+      'GET /api/ops/:op',
+      'GET /api/producao',
+      'GET /api/producao/:id',
+      'PATCH /api/producao/:id',
+      'GET /api/cq/lotes/:op',
+      'GET /api/cq/lote-resumo/:op',
+      'POST /api/cq/analises',
+      'GET /api/cq/analises/:op',
+      'GET /api/sync/status',
+      'POST /api/sync/run'
+    ],
   });
 });
 
@@ -204,10 +207,46 @@ app.get('/api/clientes', async (req, res) => {
 });
 
 // =========================
+// MATÉRIAS-PRIMAS
+// =========================
+
+app.get('/api/materias-primas/:codigo', async (req, res) => {
+  try {
+    const { codigo } = req.params;
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          mp_codigo,
+          mp_nome
+        FROM cli_materia_prima
+        WHERE TRIM(mp_codigo) = TRIM(?)
+        LIMIT 1
+      `,
+      [codigo]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 404, 'Matéria-prima não encontrada');
+    }
+
+    res.json({
+      ok: true,
+      data: {
+        codigo: rows[0].mp_codigo,
+        nome: rows[0].mp_nome,
+      }
+    });
+  } catch (err) {
+    console.error('GET /api/materias-primas/:codigo erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar matéria-prima', err.message);
+  }
+});
+
+// =========================
 // FACTORYFLOW - PEDIDOS
 // =========================
 
-// Lista os pedidos, agrupando todos os itens/lotes do pedido
 app.get('/api/pedidos', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 100), 1000);
@@ -299,7 +338,6 @@ app.get('/api/pedidos', async (req, res) => {
   }
 });
 
-// Detalhe de 1 pedido com todos os lotes/itens
 app.get('/api/pedidos/:numero', async (req, res) => {
   try {
     const { numero } = req.params;
@@ -360,7 +398,6 @@ app.get('/api/pedidos/:numero', async (req, res) => {
 // FACTORYFLOW - OPS
 // =========================
 
-// Lista OPs
 app.get('/api/ops', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 100), 1000);
@@ -460,7 +497,6 @@ app.get('/api/ops', async (req, res) => {
   }
 });
 
-// Detalhe da OP, trazendo todos os registros ligados a ela
 app.get('/api/ops/:op', async (req, res) => {
   try {
     const { op } = req.params;
@@ -662,7 +698,6 @@ app.patch('/api/producao/:id', async (req, res) => {
 // CQ VISION
 // =========================
 
-// Busca um lote/OP e retorna tudo que vier dessa OP no banco
 app.get('/api/cq/lotes/:op', async (req, res) => {
   try {
     const { op } = req.params;
@@ -721,7 +756,6 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
   }
 });
 
-// CQ VISION - resumo limpo (novo endpoint)
 app.get('/api/cq/lote-resumo/:op', async (req, res) => {
   try {
     const { op } = req.params;
@@ -780,6 +814,175 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
     sendError(res, 500, 'Erro ao buscar resumo do lote', err.message);
   }
 });
+
+app.post('/api/cq/analises', async (req, res) => {
+  try {
+    const {
+      op,
+      pedido,
+      cliente_codigo,
+      cliente_nome,
+      produto_codigo,
+      produto_nome,
+      revisao,
+      viscosidade_padrao,
+      densidade_padrao,
+      fineza_padrao,
+      viscosidade_encontrada,
+      densidade_encontrada,
+      fineza_encontrada,
+      solidos_a,
+      solidos_ab,
+      observacoes,
+      resultado,
+      usuario,
+      reajustes
+    } = req.body || {};
+
+    if (!op) {
+      return sendError(res, 400, 'Informe a OP');
+    }
+
+    const [result] = await dbPool.query(
+      `
+        INSERT INTO cq_analises (
+          op,
+          pedido,
+          cliente_codigo,
+          cliente_nome,
+          produto_codigo,
+          produto_nome,
+          revisao,
+          viscosidade_padrao,
+          densidade_padrao,
+          fineza_padrao,
+          viscosidade_encontrada,
+          densidade_encontrada,
+          fineza_encontrada,
+          solidos_a,
+          solidos_ab,
+          observacoes,
+          resultado,
+          usuario
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      [
+        op || null,
+        pedido || null,
+        cliente_codigo || null,
+        cliente_nome || null,
+        produto_codigo || null,
+        produto_nome || null,
+        revisao || null,
+        viscosidade_padrao || null,
+        densidade_padrao || null,
+        fineza_padrao || null,
+        viscosidade_encontrada || null,
+        densidade_encontrada || null,
+        fineza_encontrada || null,
+        solidos_a || null,
+        solidos_ab || null,
+        observacoes || null,
+        resultado || null,
+        usuario || null
+      ]
+    );
+
+    const analiseId = result.insertId;
+
+    if (Array.isArray(reajustes) && reajustes.length > 0) {
+      for (const reajuste of reajustes) {
+        await dbPool.query(
+          `
+            INSERT INTO cq_analises_reajustes (
+              analise_id,
+              numero_reajuste,
+              materia_prima_codigo,
+              materia_prima_nome,
+              motivo_reajuste,
+              observacao_reajuste
+            ) VALUES (?, ?, ?, ?, ?, ?)
+          `,
+          [
+            analiseId,
+            reajuste.numero_reajuste || 1,
+            reajuste.materia_prima_codigo || null,
+            reajuste.materia_prima_nome || null,
+            reajuste.motivo_reajuste || null,
+            reajuste.observacao_reajuste || null
+          ]
+        );
+      }
+    }
+
+    const [analiseRows] = await dbPool.query(
+      `SELECT * FROM cq_analises WHERE id = ? LIMIT 1`,
+      [analiseId]
+    );
+
+    const [reajusteRows] = await dbPool.query(
+      `
+        SELECT *
+        FROM cq_analises_reajustes
+        WHERE analise_id = ?
+        ORDER BY numero_reajuste ASC, id ASC
+      `,
+      [analiseId]
+    );
+
+    res.status(201).json({
+      ok: true,
+      message: 'Análise salva com sucesso',
+      data: {
+        analise: analiseRows[0],
+        reajustes: reajusteRows
+      }
+    });
+  } catch (err) {
+    console.error('POST /api/cq/analises erro:', err.message);
+    sendError(res, 500, 'Erro ao salvar análise', err.message);
+  }
+});
+
+app.get('/api/cq/analises/:op', async (req, res) => {
+  try {
+    const { op } = req.params;
+
+    const [analises] = await dbPool.query(
+      `
+        SELECT *
+        FROM cq_analises
+        WHERE op = ?
+        ORDER BY criado_em DESC, id DESC
+      `,
+      [op]
+    );
+
+    for (const analise of analises) {
+      const [reajustes] = await dbPool.query(
+        `
+          SELECT *
+          FROM cq_analises_reajustes
+          WHERE analise_id = ?
+          ORDER BY numero_reajuste ASC, id ASC
+        `,
+        [analise.id]
+      );
+
+      analise.reajustes = reajustes;
+    }
+
+    res.json({
+      ok: true,
+      total: analises.length,
+      data: analises
+    });
+  } catch (err) {
+    console.error('GET /api/cq/analises/:op erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar histórico de análises', err.message);
+  }
+});
+
 // =========================
 // SYNC
 // =========================
@@ -831,6 +1034,7 @@ app.use((req, res) => {
       console.log('   GET  /health');
       console.log('   GET  /api/stats');
       console.log('   GET  /api/clientes');
+      console.log('   GET  /api/materias-primas/:codigo');
       console.log('   GET  /api/pedidos');
       console.log('   GET  /api/pedidos/:numero');
       console.log('   GET  /api/ops');
@@ -840,6 +1044,8 @@ app.use((req, res) => {
       console.log('   PATCH /api/producao/:id');
       console.log('   GET  /api/cq/lotes/:op');
       console.log('   GET  /api/cq/lote-resumo/:op');
+      console.log('   POST /api/cq/analises');
+      console.log('   GET  /api/cq/analises/:op');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
     });
