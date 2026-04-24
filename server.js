@@ -836,7 +836,10 @@ app.post('/api/cq/analises', async (req, res) => {
       observacoes,
       resultado,
       usuario,
-      reajustes
+      reajustes,
+      data_analise,
+      viscosidade_inicial,
+      viscosidade_final
     } = req.body || {};
 
     if (!op) {
@@ -863,8 +866,11 @@ app.post('/api/cq/analises', async (req, res) => {
           solidos_ab,
           observacoes,
           resultado,
-          usuario
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          usuario,
+          data_analise,
+          viscosidade_inicial,
+          viscosidade_final
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         op || null,
@@ -884,7 +890,10 @@ app.post('/api/cq/analises', async (req, res) => {
         solidos_ab || null,
         observacoes || null,
         resultado || null,
-        usuario || null
+        usuario || null,
+        data_analise || new Date().toISOString().slice(0, 10),
+        viscosidade_inicial || null,
+        viscosidade_final || null
       ]
     );
 
@@ -899,15 +908,17 @@ app.post('/api/cq/analises', async (req, res) => {
               numero_reajuste,
               materia_prima_codigo,
               materia_prima_nome,
+              materia_prima_qtd,
               motivo_reajuste,
               observacao_reajuste
-            ) VALUES (?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
           `,
           [
             analiseId,
             reajuste.numero_reajuste || 1,
             reajuste.materia_prima_codigo || null,
             reajuste.materia_prima_nome || null,
+            reajuste.materia_prima_qtd || null,
             reajuste.motivo_reajuste || null,
             reajuste.observacao_reajuste || null
           ]
@@ -915,29 +926,12 @@ app.post('/api/cq/analises', async (req, res) => {
       }
     }
 
-    const [analiseRows] = await dbPool.query(
-      `SELECT * FROM cq_analises WHERE id = ? LIMIT 1`,
-      [analiseId]
-    );
-
-    const [reajusteRows] = await dbPool.query(
-      `
-        SELECT *
-        FROM cq_analises_reajustes
-        WHERE analise_id = ?
-        ORDER BY numero_reajuste ASC, id ASC
-      `,
-      [analiseId]
-    );
-
-    res.status(201).json({
+    res.json({
       ok: true,
-      message: 'Análise salva com sucesso',
-      data: {
-        analise: analiseRows[0],
-        reajustes: reajusteRows
-      }
+      id: analiseId,
+      message: 'Análise salva com sucesso'
     });
+
   } catch (err) {
     console.error('POST /api/cq/analises erro:', err.message);
     sendError(res, 500, 'Erro ao salvar análise', err.message);
