@@ -1,31 +1,4 @@
-[09:50, 25/04/2026] joão : -- FactoryFlow / Pedidos Novos - campo de controle de processamento
-
-ALTER TABLE cli_pedidos_itens
-ADD COLUMN factoryflow_processado TINYINT(1) NOT NULL DEFAULT 0 AFTER pits_fineza,
-ADD COLUMN factoryflow_processado_em DATETIME NULL AFTER factoryflow_processado;
-
--- Índice opcional para acelerar a listagem de pedidos novos
-CREATE INDEX idx_cli_pedidos_factoryflow_processado
-ON cli_pedidos_itens (factoryflow_processado, pits_numero);
-[09:51, 25/04/2026] joão : & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h db.induscolor.com.br -P 3306 -u induscolor -p
-[09:51, 25/04/2026] joão : Adxcb$332#21xVc%
-[09:57, 25/04/2026] joão : at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:128:12)
-    at Module._extensions..js (node:internal/modules/cjs/loader:1422:10)
-    at internalCompileFunction (node:internal/vm:76:18)
-    at Module.load (node:internal/modules/cjs/loader:1203:32)
-> node server.js
-    at Module._load (node:internal/modules/cjs/loader:1019:12)
-    at node:internal/main/run_main_module:28:49
-    at wrapSafe (node:internal/modules/cjs/loader:1283:20)
-    at Module._compile (node:internal/modules/cjs/loader:1328:27)
-                                           ^^
-/app/server.js:486
-npm warn config production Use --omit=dev instead.
-Node.js v18.20.8
-MAX(COALESCE(p.factoryflow_processado, 0)) AS factoryflow_processado,
-SyntaxError: Unexpected identifier
-…
-[10:07, 25/04/2026] joão : 'use strict';
+'use strict';
 
 require('dotenv').config();
 
