@@ -393,6 +393,118 @@ app.get('/api/pedidos/:numero', async (req, res) => {
     sendError(res, 500, 'Erro ao buscar pedido', err.message);
   }
 });
+// ===================================================
+// PATCH BACKEND - PEDIDOS PROCESSADOS FACTORYFLOW
+// Cole este bloco no server.js antes da seção FACTORYFLOW - OPS.
+// ===================================================
+
+// ADICIONE ESTA ROTA ANTES DE:
+// app.get('/api/pedidos/:numero', ...)
+
+app.patch('/api/pedidos/:numero/processado', async (req, res) => {
+  try {
+    const { numero } = req.params;
+
+    const [result] = await dbPool.query(
+      `
+        UPDATE cli_pedidos_itens
+        SET
+          factoryflow_processado = 1,
+          factoryflow_processado_em = NOW()
+        WHERE pits_numero = ?
+      `,
+      [numero]
+    );
+
+    if (!result.affectedRows) {
+      return sendError(res, 404, 'Pedido não encontrado');
+    }
+
+    res.json({
+      ok: true,
+      message: 'Pedido marcado como processado no FactoryFlow',
+      numero,
+      affectedRows: result.affectedRows
+    });
+  } catch (err) {
+    console.error('PATCH /api/pedidos/:numero/processado erro:', err.message);
+    sendError(res, 500, 'Erro ao marcar pedido como processado', err.message);
+  }
+});
+
+app.patch('/api/pedidos/:numero/desprocessar', async (req, res) => {
+  try {
+    const { numero } = req.params;
+
+    const [result] = await dbPool.query(
+      `
+        UPDATE cli_pedidos_itens
+        SET
+          factoryflow_processado = 0,
+          factoryflow_processado_em = NULL
+        WHERE pits_numero = ?
+      `,
+      [numero]
+    );
+
+    if (!result.affectedRows) {
+      return sendError(res, 404, 'Pedido não encontrado');
+    }
+
+    res.json({
+      ok: true,
+      message: 'Pedido reaberto para o FactoryFlow',
+      numero,
+      affectedRows: result.affectedRows
+    });
+  } catch (err) {
+    console.error('PATCH /api/pedidos/:numero/desprocessar erro:', err.message);
+    sendError(res, 500, 'Erro ao reabrir pedido', err.message);
+  }
+});
+
+
+// ===================================================
+// ALTERAÇÃO NO app.get('/api/pedidos', ...)
+// ===================================================
+//
+// Depois de:
+// const ultimoId = toPositiveInt(req.query.ultimoId, 0);
+//
+// adicione:
+//
+const incluirProcessados = req.query.incluirProcessados === '1';
+//
+// Depois dos filtros search/cliente/somenteNovos, antes do "const where", adicione:
+//
+if (!incluirProcessados) {
+  conditions.push('COALESCE(p.factoryflow_processado, 0) = 0');
+}
+//
+// No SELECT principal de pedidos, adicione:
+//
+MAX(COALESCE(p.factoryflow_processado, 0)) AS factoryflow_processado,
+MAX(p.factoryflow_processado_em) AS factoryflow_processado_em,
+//
+//
+// ===================================================
+// ALTERAÇÃO NO app.get('/api/pedidos/:numero', ...)
+// ===================================================
+//
+// No SELECT dos itens, adicione:
+//
+COALESCE(p.factoryflow_processado, 0) AS factoryflow_processado,
+p.factoryflow_processado_em,
+//
+//
+// ===================================================
+// ALTERAÇÃO NO ROOT app.get('/'), opcional
+// ===================================================
+//
+// Adicione em endpoints:
+//
+'PATCH /api/pedidos/:numero/processado',
+'PATCH /api/pedidos/:numero/desprocessar',
 
 // =========================
 // FACTORYFLOW - OPS
