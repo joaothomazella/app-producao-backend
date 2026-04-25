@@ -1,4 +1,31 @@
-'use strict';
+[09:50, 25/04/2026] joão : -- FactoryFlow / Pedidos Novos - campo de controle de processamento
+
+ALTER TABLE cli_pedidos_itens
+ADD COLUMN factoryflow_processado TINYINT(1) NOT NULL DEFAULT 0 AFTER pits_fineza,
+ADD COLUMN factoryflow_processado_em DATETIME NULL AFTER factoryflow_processado;
+
+-- Índice opcional para acelerar a listagem de pedidos novos
+CREATE INDEX idx_cli_pedidos_factoryflow_processado
+ON cli_pedidos_itens (factoryflow_processado, pits_numero);
+[09:51, 25/04/2026] joão : & "C:\Program Files\MySQL\MySQL Server 8.0\bin\mysql.exe" -h db.induscolor.com.br -P 3306 -u induscolor -p
+[09:51, 25/04/2026] joão : Adxcb$332#21xVc%
+[09:57, 25/04/2026] joão : at Function.executeUserEntryPoint [as runMain] (node:internal/modules/run_main:128:12)
+    at Module._extensions..js (node:internal/modules/cjs/loader:1422:10)
+    at internalCompileFunction (node:internal/vm:76:18)
+    at Module.load (node:internal/modules/cjs/loader:1203:32)
+> node server.js
+    at Module._load (node:internal/modules/cjs/loader:1019:12)
+    at node:internal/main/run_main_module:28:49
+    at wrapSafe (node:internal/modules/cjs/loader:1283:20)
+    at Module._compile (node:internal/modules/cjs/loader:1328:27)
+                                           ^^
+/app/server.js:486
+npm warn config production Use --omit=dev instead.
+Node.js v18.20.8
+MAX(COALESCE(p.factoryflow_processado, 0)) AS factoryflow_processado,
+SyntaxError: Unexpected identifier
+…
+[10:07, 25/04/2026] joão : 'use strict';
 
 require('dotenv').config();
 
@@ -44,6 +71,26 @@ async function tableExists(tableName) {
   return Number(rows[0]?.total || 0) > 0;
 }
 
+async function columnExists(tableName, columnName) {
+  const [rows] = await dbPool.query(
+    `
+      SELECT COUNT(*) AS total
+      FROM information_schema.columns
+      WHERE table_schema = DATABASE()
+        AND table_name = ?
+        AND column_name = ?
+    `,
+    [tableName, columnName]
+  );
+  return Number(rows[0]?.total || 0) > 0;
+}
+
+async function hasFactoryFlowProcessadoColumns() {
+  const hasFlag = await columnExists('cli_pedidos_itens', 'factoryflow_processado');
+  const hasDate = await columnExists('cli_pedidos_itens', 'factoryflow_processado_em');
+  return { hasFlag, hasDate, ok: hasFlag && hasDate };
+}
+
 // =========================
 // HEALTH / ROOT
 // =========================
@@ -52,7 +99,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString(),
     endpoints: [
       'GET /health',
@@ -61,6 +108,8 @@ app.get('/', (req, res) => {
       'GET /api/materias-primas/:codigo',
       'GET /api/pedidos',
       'GET /api/pedidos/:numero',
+      'PATCH /api/pedidos/:numero/processado',
+      'PATCH /api/pedidos/:numero/desprocessar',
       'GET /api/ops',
       'GET /api/ops/:op',
       'GET /api/producao',
@@ -80,7 +129,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.0.0',
+    version: '2.1.0',
     timestamp: new Date().toISOString(),
     sync: getSyncStats(),
   });
@@ -132,6 +181,8 @@ app.get('/api/stats', async (req, res) => {
       };
     }
 
+    const processadoColumns = await hasFactoryFlowProcessadoColumns().catch(() => ({ ok: false }));
+
     res.json({
       ok: true,
       data: {
@@ -141,6 +192,7 @@ app.get('/api/stats', async (req, res) => {
         ultimo_id: Number(ultimaCargaRow.ultimo_id || 0),
         ultima_previsao: ultimaCargaRow.ultima_previsao || null,
         producao,
+        factoryflow_processado_configurado: !!processadoColumns.ok,
         sync: getSyncStats(),
       },
     });
@@ -156,7 +208,7 @@ app.get('/api/stats', async (req, res) => {
 
 app.get('/api/clientes', async (req, res) => {
   try {
-    const search = req.query.search ? `%${req.query.search}%` : null;
+    const search = req.query.search ? %${req.query.search}% : null;
     const limit = Math.min(toPositiveInt(req.query.limit, 300), 2000);
     const offset = toPositiveInt(req.query.offset, 0);
 
@@ -168,10 +220,10 @@ app.get('/api/clientes', async (req, res) => {
       params.push(search, search, search);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const where = conditions.length ? WHERE ${conditions.join(' AND ')} : '';
 
     const [[{ total }]] = await dbPool.query(
-      `SELECT COUNT(*) AS total FROM cli_clientes ${where}`,
+      SELECT COUNT(*) AS total FROM cli_clientes ${where},
       params
     );
 
@@ -251,10 +303,12 @@ app.get('/api/pedidos', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 100), 1000);
     const offset = toPositiveInt(req.query.offset, 0);
-    const search = req.query.search ? `%${req.query.search}%` : null;
+    const search = req.query.search ? %${req.query.search}% : null;
     const cliente = req.query.cliente || null;
     const somenteNovos = req.query.somenteNovos === '1';
+    const incluirProcessados = req.query.incluirProcessados === '1';
     const ultimoId = toPositiveInt(req.query.ultimoId, 0);
+    const processadoColumns = await hasFactoryFlowProcessadoColumns();
 
     const conditions = [];
     const params = [];
@@ -282,7 +336,16 @@ app.get('/api/pedidos', async (req, res) => {
       params.push(ultimoId);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    if (processadoColumns.ok && !incluirProcessados) {
+      conditions.push('COALESCE(p.factoryflow_processado, 0) = 0');
+    }
+
+    const where = conditions.length ? WHERE ${conditions.join(' AND ')} : '';
+    const processadoSelect = processadoColumns.ok
+      ? `MAX(COALESCE(p.factoryflow_processado, 0)) AS factoryflow_processado,
+         MAX(p.factoryflow_processado_em) AS factoryflow_processado_em,`
+      : `0 AS factoryflow_processado,
+         NULL AS factoryflow_processado_em,`;
 
     const [[{ total }]] = await dbPool.query(
       `
@@ -310,6 +373,7 @@ app.get('/api/pedidos', async (req, res) => {
           COUNT(DISTINCT p.pits_op) AS total_ops,
           SUM(COALESCE(p.pits_qtde, 0)) AS total_quantidade,
           SUM(COALESCE(p.pits_peso, 0)) AS total_peso,
+          ${processadoSelect}
           MAX(p.id) AS ultimo_id
         FROM cli_pedidos_itens p
         LEFT JOIN cli_clientes c
@@ -330,6 +394,7 @@ app.get('/api/pedidos', async (req, res) => {
       total: Number(total),
       limit,
       offset,
+      processado_configurado: !!processadoColumns.ok,
       data: rows,
     });
   } catch (err) {
@@ -338,72 +403,19 @@ app.get('/api/pedidos', async (req, res) => {
   }
 });
 
-app.get('/api/pedidos/:numero', async (req, res) => {
-  try {
-    const { numero } = req.params;
-
-    const [rows] = await dbPool.query(
-      `
-        SELECT
-          p.id,
-          p.pits_numero,
-          p.pits_cliente,
-          c.cli_nome AS nome_cliente,
-          p.pits_previsao,
-          p.pits_produto,
-          p.pits_op,
-          p.pits_nome_produto,
-          p.pits_qtde,
-          p.pits_peso,
-          p.pits_revisao,
-          p.pits_viscosidade,
-          p.pits_densidade,
-          p.pits_fineza
-        FROM cli_pedidos_itens p
-        LEFT JOIN cli_clientes c
-          ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
-        WHERE p.pits_numero = ?
-        ORDER BY p.id ASC
-      `,
-      [numero]
-    );
-
-    if (!rows.length) {
-      return sendError(res, 404, 'Pedido não encontrado');
-    }
-
-    const header = {
-      pits_numero: rows[0].pits_numero,
-      pits_cliente: rows[0].pits_cliente,
-      nome_cliente: rows[0].nome_cliente,
-      pits_previsao: rows[0].pits_previsao,
-      total_itens: rows.length,
-      total_ops: new Set(rows.map((r) => r.pits_op)).size,
-      total_quantidade: rows.reduce((acc, item) => acc + Number(item.pits_qtde || 0), 0),
-      total_peso: rows.reduce((acc, item) => acc + Number(item.pits_peso || 0), 0),
-    };
-
-    res.json({
-      ok: true,
-      pedido: header,
-      itens: rows,
-    });
-  } catch (err) {
-    console.error('GET /api/pedidos/:numero erro:', err.message);
-    sendError(res, 500, 'Erro ao buscar pedido', err.message);
-  }
-});
-// ===================================================
-// PATCH BACKEND - PEDIDOS PROCESSADOS FACTORYFLOW
-// Cole este bloco no server.js antes da seção FACTORYFLOW - OPS.
-// ===================================================
-
-// ADICIONE ESTA ROTA ANTES DE:
-// app.get('/api/pedidos/:numero', ...)
-
 app.patch('/api/pedidos/:numero/processado', async (req, res) => {
   try {
     const { numero } = req.params;
+    const processadoColumns = await hasFactoryFlowProcessadoColumns();
+
+    if (!processadoColumns.ok) {
+      return sendError(
+        res,
+        500,
+        'Colunas de processado ainda não existem no MySQL',
+        'Rode o ALTER TABLE para criar factoryflow_processado e factoryflow_processado_em em cli_pedidos_itens.'
+      );
+    }
 
     const [result] = await dbPool.query(
       `
@@ -424,7 +436,7 @@ app.patch('/api/pedidos/:numero/processado', async (req, res) => {
       ok: true,
       message: 'Pedido marcado como processado no FactoryFlow',
       numero,
-      affectedRows: result.affectedRows
+      affectedRows: result.affectedRows,
     });
   } catch (err) {
     console.error('PATCH /api/pedidos/:numero/processado erro:', err.message);
@@ -435,6 +447,16 @@ app.patch('/api/pedidos/:numero/processado', async (req, res) => {
 app.patch('/api/pedidos/:numero/desprocessar', async (req, res) => {
   try {
     const { numero } = req.params;
+    const processadoColumns = await hasFactoryFlowProcessadoColumns();
+
+    if (!processadoColumns.ok) {
+      return sendError(
+        res,
+        500,
+        'Colunas de processado ainda não existem no MySQL',
+        'Rode o ALTER TABLE para criar factoryflow_processado e factoryflow_processado_em em cli_pedidos_itens.'
+      );
+    }
 
     const [result] = await dbPool.query(
       `
@@ -455,7 +477,7 @@ app.patch('/api/pedidos/:numero/desprocessar', async (req, res) => {
       ok: true,
       message: 'Pedido reaberto para o FactoryFlow',
       numero,
-      affectedRows: result.affectedRows
+      affectedRows: result.affectedRows,
     });
   } catch (err) {
     console.error('PATCH /api/pedidos/:numero/desprocessar erro:', err.message);
@@ -463,48 +485,83 @@ app.patch('/api/pedidos/:numero/desprocessar', async (req, res) => {
   }
 });
 
+app.get('/api/pedidos/:numero', async (req, res) => {
+  try {
+    const { numero } = req.params;
+    const processadoColumns = await hasFactoryFlowProcessadoColumns();
+    const processadoItemSelect = processadoColumns.ok
+      ? `COALESCE(p.factoryflow_processado, 0) AS factoryflow_processado,
+         p.factoryflow_processado_em,`
+      : `0 AS factoryflow_processado,
+         NULL AS factoryflow_processado_em,`;
 
-// ===================================================
-// ALTERAÇÃO NO app.get('/api/pedidos', ...)
-// ===================================================
-//
-// Depois de:
-// const ultimoId = toPositiveInt(req.query.ultimoId, 0);
-//
-// adicione:
-//
-const incluirProcessados = req.query.incluirProcessados === '1';
-//
-// Depois dos filtros search/cliente/somenteNovos, antes do "const where", adicione:
-//
-if (!incluirProcessados) {
-  conditions.push('COALESCE(p.factoryflow_processado, 0) = 0');
-}
-//
-// No SELECT principal de pedidos, adicione:
-//
-MAX(COALESCE(p.factoryflow_processado, 0)) AS factoryflow_processado,
-MAX(p.factoryflow_processado_em) AS factoryflow_processado_em,
-//
-//
-// ===================================================
-// ALTERAÇÃO NO app.get('/api/pedidos/:numero', ...)
-// ===================================================
-//
-// No SELECT dos itens, adicione:
-//
-COALESCE(p.factoryflow_processado, 0) AS factoryflow_processado,
-p.factoryflow_processado_em,
-//
-//
-// ===================================================
-// ALTERAÇÃO NO ROOT app.get('/'), opcional
-// ===================================================
-//
-// Adicione em endpoints:
-//
-'PATCH /api/pedidos/:numero/processado',
-'PATCH /api/pedidos/:numero/desprocessar',
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          p.id,
+          p.pits_numero,
+          p.pits_cliente,
+          c.cli_nome AS nome_cliente,
+          p.pits_previsao,
+          p.pits_produto,
+          p.pits_op,
+          p.pits_nome_produto,
+          p.pits_qtde,
+          p.pits_peso,
+          p.pits_revisao,
+          p.pits_viscosidade,
+          p.pits_densidade,
+          p.pits_fineza,
+          ${processadoItemSelect}
+          c.cli_endereco,
+          c.cli_bairro,
+          c.cli_cidade,
+          c.cli_cep,
+          c.cli_estado
+        FROM cli_pedidos_itens p
+        LEFT JOIN cli_clientes c
+          ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+        WHERE p.pits_numero = ?
+        ORDER BY p.id ASC
+      `,
+      [numero]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 404, 'Pedido não encontrado');
+    }
+
+    const header = {
+      pits_numero: rows[0].pits_numero,
+      pits_cliente: rows[0].pits_cliente,
+      nome_cliente: rows[0].nome_cliente,
+      cliente: rows[0].nome_cliente,
+      pits_previsao: rows[0].pits_previsao,
+      previsao_entrega: rows[0].pits_previsao,
+      cli_endereco: rows[0].cli_endereco,
+      cli_bairro: rows[0].cli_bairro,
+      cli_cidade: rows[0].cli_cidade,
+      cli_cep: rows[0].cli_cep,
+      cli_estado: rows[0].cli_estado,
+      factoryflow_processado: Number(rows[0].factoryflow_processado || 0),
+      factoryflow_processado_em: rows[0].factoryflow_processado_em || null,
+      total_itens: rows.length,
+      total_ops: new Set(rows.map((r) => r.pits_op)).size,
+      total_quantidade: rows.reduce((acc, item) => acc + Number(item.pits_qtde || 0), 0),
+      total_peso: rows.reduce((acc, item) => acc + Number(item.pits_peso || 0), 0),
+    };
+
+    res.json({
+      ok: true,
+      pedido: header,
+      data: header,
+      itens: rows,
+    });
+  } catch (err) {
+    console.error('GET /api/pedidos/:numero erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar pedido', err.message);
+  }
+});
 
 // =========================
 // FACTORYFLOW - OPS
@@ -516,13 +573,13 @@ app.get('/api/ops', async (req, res) => {
     const offset = toPositiveInt(req.query.offset, 0);
     const pedido = req.query.pedido || null;
     const cliente = req.query.cliente || null;
-    const search = req.query.search ? `%${req.query.search}%` : null;
+    const search = req.query.search ? %${req.query.search}% : null;
     const somenteNovos = req.query.somenteNovos === '1';
     const ultimoId = toPositiveInt(req.query.ultimoId, 0);
 
     const conditions = [
-      `p.pits_op IS NOT NULL`,
-      `p.pits_op <> ''`,
+      p.pits_op IS NOT NULL,
+      p.pits_op <> '',
     ];
     const params = [];
 
@@ -554,7 +611,7 @@ app.get('/api/ops', async (req, res) => {
       params.push(ultimoId);
     }
 
-    const where = `WHERE ${conditions.join(' AND ')}`;
+    const where = WHERE ${conditions.join(' AND ')};
 
     const [[{ total }]] = await dbPool.query(
       `
@@ -683,7 +740,7 @@ app.get('/api/producao', async (req, res) => {
     const offset = toPositiveInt(req.query.offset, 0);
     const status = req.query.status || null;
     const setor = req.query.setor || null;
-    const search = req.query.search ? `%${req.query.search}%` : null;
+    const search = req.query.search ? %${req.query.search}% : null;
 
     const conditions = [];
     const params = [];
@@ -703,10 +760,10 @@ app.get('/api/producao', async (req, res) => {
       params.push(search, search, search, search);
     }
 
-    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const where = conditions.length ? WHERE ${conditions.join(' AND ')} : '';
 
     const [[{ total }]] = await dbPool.query(
-      `SELECT COUNT(*) AS total FROM producao_lotes ${where}`,
+      SELECT COUNT(*) AS total FROM producao_lotes ${where},
       params
     );
 
@@ -764,29 +821,36 @@ app.patch('/api/producao/:id', async (req, res) => {
       return sendError(res, 404, 'Tabela producao_lotes não encontrada');
     }
 
-    const { status, setor_atual } = req.body || {};
+    const allowedFields = [
+      'status',
+      'setor_atual',
+      'tipo_lote',
+      'prioridade',
+      'classificado_pcp',
+      'liberado_pcp',
+      'data_liberacao_pcp',
+      'rota_escolhida'
+    ];
 
-    if (!status && !setor_atual) {
-      return sendError(res, 400, 'Informe status e/ou setor_atual no body');
-    }
-
+    const body = req.body || {};
     const fields = [];
     const params = [];
 
-    if (status) {
-      fields.push('status = ?');
-      params.push(status);
+    for (const field of allowedFields) {
+      if (Object.prototype.hasOwnProperty.call(body, field)) {
+        fields.push(${field} = ?);
+        params.push(body[field]);
+      }
     }
 
-    if (setor_atual) {
-      fields.push('setor_atual = ?');
-      params.push(setor_atual);
+    if (!fields.length) {
+      return sendError(res, 400, 'Informe ao menos um campo válido para atualizar');
     }
 
     params.push(req.params.id);
 
     const [result] = await dbPool.query(
-      `UPDATE producao_lotes SET ${fields.join(', ')} WHERE id = ?`,
+      UPDATE producao_lotes SET ${fields.join(', ')} WHERE id = ?,
       params
     );
 
@@ -1118,7 +1182,7 @@ app.post('/api/sync/run', async (req, res) => {
 // =========================
 
 app.use((req, res) => {
-  sendError(res, 404, `Rota não encontrada: ${req.method} ${req.path}`);
+  sendError(res, 404, Rota não encontrada: ${req.method} ${req.path});
 });
 
 // =========================
@@ -1128,13 +1192,13 @@ app.use((req, res) => {
 (async () => {
   try {
     console.log('\n╔════════════════════════════════════════════════════╗');
-    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.0.0    ║');
+    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.1.0    ║');
     console.log('╚════════════════════════════════════════════════════╝\n');
 
     await testConnection();
 
     app.listen(PORT, () => {
-      console.log(`🚀 API rodando em http://localhost:${PORT}\n`);
+      console.log(🚀 API rodando em http://localhost:${PORT}\n);
       console.log('Rotas disponíveis:');
       console.log('   GET  /');
       console.log('   GET  /health');
@@ -1143,6 +1207,8 @@ app.use((req, res) => {
       console.log('   GET  /api/materias-primas/:codigo');
       console.log('   GET  /api/pedidos');
       console.log('   GET  /api/pedidos/:numero');
+      console.log('   PATCH /api/pedidos/:numero/processado');
+      console.log('   PATCH /api/pedidos/:numero/desprocessar');
       console.log('   GET  /api/ops');
       console.log('   GET  /api/ops/:op');
       console.log('   GET  /api/producao');
