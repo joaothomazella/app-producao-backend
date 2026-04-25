@@ -181,7 +181,7 @@ app.get('/api/stats', async (req, res) => {
 
 app.get('/api/clientes', async (req, res) => {
   try {
-    const search = req.query.search ? %${req.query.search}% : null;
+    const search = req.query.search ? `%${req.query.search}%` : null;
     const limit = Math.min(toPositiveInt(req.query.limit, 300), 2000);
     const offset = toPositiveInt(req.query.offset, 0);
 
@@ -193,10 +193,10 @@ app.get('/api/clientes', async (req, res) => {
       params.push(search, search, search);
     }
 
-    const where = conditions.length ? WHERE ${conditions.join(' AND ')} : '';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const [[{ total }]] = await dbPool.query(
-      SELECT COUNT(*) AS total FROM cli_clientes ${where},
+      `SELECT COUNT(*) AS total FROM cli_clientes ${where}`,
       params
     );
 
@@ -276,7 +276,7 @@ app.get('/api/pedidos', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 100), 1000);
     const offset = toPositiveInt(req.query.offset, 0);
-    const search = req.query.search ? %${req.query.search}% : null;
+    const search = req.query.search ? `%${req.query.search}%` : null;
     const cliente = req.query.cliente || null;
     const somenteNovos = req.query.somenteNovos === '1';
     const incluirProcessados = req.query.incluirProcessados === '1';
@@ -313,7 +313,7 @@ app.get('/api/pedidos', async (req, res) => {
       conditions.push('COALESCE(p.factoryflow_processado, 0) = 0');
     }
 
-    const where = conditions.length ? WHERE ${conditions.join(' AND ')} : '';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
     const processadoSelect = processadoColumns.ok
       ? `MAX(COALESCE(p.factoryflow_processado, 0)) AS factoryflow_processado,
          MAX(p.factoryflow_processado_em) AS factoryflow_processado_em,`
@@ -546,13 +546,13 @@ app.get('/api/ops', async (req, res) => {
     const offset = toPositiveInt(req.query.offset, 0);
     const pedido = req.query.pedido || null;
     const cliente = req.query.cliente || null;
-    const search = req.query.search ? %${req.query.search}% : null;
+    const search = req.query.search ? `%${req.query.search}%` : null;
     const somenteNovos = req.query.somenteNovos === '1';
     const ultimoId = toPositiveInt(req.query.ultimoId, 0);
 
     const conditions = [
-      p.pits_op IS NOT NULL,
-      p.pits_op <> '',
+      `p.pits_op IS NOT NULL`,
+      `p.pits_op <> ''`,
     ];
     const params = [];
 
@@ -584,7 +584,7 @@ app.get('/api/ops', async (req, res) => {
       params.push(ultimoId);
     }
 
-    const where = WHERE ${conditions.join(' AND ')};
+    const where = `WHERE ${conditions.join(' AND ')}`;
 
     const [[{ total }]] = await dbPool.query(
       `
@@ -713,7 +713,7 @@ app.get('/api/producao', async (req, res) => {
     const offset = toPositiveInt(req.query.offset, 0);
     const status = req.query.status || null;
     const setor = req.query.setor || null;
-    const search = req.query.search ? %${req.query.search}% : null;
+    const search = req.query.search ? `%${req.query.search}%` : null;
 
     const conditions = [];
     const params = [];
@@ -733,10 +733,10 @@ app.get('/api/producao', async (req, res) => {
       params.push(search, search, search, search);
     }
 
-    const where = conditions.length ? WHERE ${conditions.join(' AND ')} : '';
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
 
     const [[{ total }]] = await dbPool.query(
-      SELECT COUNT(*) AS total FROM producao_lotes ${where},
+      `SELECT COUNT(*) AS total FROM producao_lotes ${where}`,
       params
     );
 
@@ -811,7 +811,7 @@ app.patch('/api/producao/:id', async (req, res) => {
 
     for (const field of allowedFields) {
       if (Object.prototype.hasOwnProperty.call(body, field)) {
-        fields.push(${field} = ?);
+        fields.push(`${field} = ?`);
         params.push(body[field]);
       }
     }
@@ -823,7 +823,7 @@ app.patch('/api/producao/:id', async (req, res) => {
     params.push(req.params.id);
 
     const [result] = await dbPool.query(
-      UPDATE producao_lotes SET ${fields.join(', ')} WHERE id = ?,
+      `UPDATE producao_lotes SET ${fields.join(', ')} WHERE id = ?`,
       params
     );
 
@@ -1155,7 +1155,7 @@ app.post('/api/sync/run', async (req, res) => {
 // =========================
 
 app.use((req, res) => {
-  sendError(res, 404, Rota não encontrada: ${req.method} ${req.path});
+  sendError(res, 404, `Rota não encontrada: ${req.method} ${req.path}`);
 });
 
 // =========================
@@ -1171,7 +1171,7 @@ app.use((req, res) => {
     await testConnection();
 
     app.listen(PORT, () => {
-      console.log(🚀 API rodando em http://localhost:${PORT}\n);
+      console.log(`🚀 API rodando em http://localhost:${PORT}\n`);
       console.log('Rotas disponíveis:');
       console.log('   GET  /');
       console.log('   GET  /health');
