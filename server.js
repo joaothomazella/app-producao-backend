@@ -14,7 +14,7 @@ app.use(express.json({ limit: '2mb' }));
 app.use(cors({
   origin: process.env.CORS_ORIGIN || '*',
   methods: ['GET', 'PATCH', 'POST', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }));
 
 function sendError(res, status, message, detail) {
@@ -65,6 +65,50 @@ async function hasFactoryFlowProcessadoColumns() {
 }
 
 // =========================
+// SEGURANÇA - TOKEN/API KEY
+// =========================
+// Configure no Railway em Variables:
+// FACTORYFLOW_API_TOKEN=uma-chave-grande-e-secreta
+//
+// O frontend deve enviar em todas as chamadas /api:
+// Authorization: Bearer sua-chave
+// ou:
+// X-API-Key: sua-chave
+//
+// /health fica público para monitoramento. Todas as rotas /api ficam protegidas.
+
+const API_TOKEN = (process.env.FACTORYFLOW_API_TOKEN || process.env.API_TOKEN || '').trim();
+
+function extractToken(req) {
+  const auth = String(req.headers.authorization || '').trim();
+
+  if (auth.toLowerCase().startsWith('bearer ')) {
+    return auth.slice(7).trim();
+  }
+
+  return String(req.headers['x-api-key'] || '').trim();
+}
+
+function requireApiToken(req, res, next) {
+  if (!API_TOKEN) {
+    return sendError(
+      res,
+      503,
+      'API sem token configurado no servidor',
+      'Configure FACTORYFLOW_API_TOKEN nas variáveis de ambiente do Railway.'
+    );
+  }
+
+  const receivedToken = extractToken(req);
+
+  if (!receivedToken || receivedToken !== API_TOKEN) {
+    return sendError(res, 401, 'Acesso não autorizado', 'Token ausente ou inválido.');
+  }
+
+  return next();
+}
+
+// =========================
 // HEALTH / ROOT
 // =========================
 
@@ -72,7 +116,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.1.0',
+    version: '2.2.0-secure',
     timestamp: new Date().toISOString(),
     endpoints: [
       'GET /health',
@@ -102,11 +146,14 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.1.0',
+    version: '2.2.0-secure',
     timestamp: new Date().toISOString(),
     sync: getSyncStats(),
   });
 });
+
+// A partir daqui, toda rota /api exige token.
+app.use('/api', requireApiToken);
 
 // =========================
 // STATS GERAIS
@@ -1165,7 +1212,7 @@ app.use((req, res) => {
 (async () => {
   try {
     console.log('\n╔════════════════════════════════════════════════════╗');
-    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.1.0    ║');
+    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.2.0 SECURE    ║');
     console.log('╚════════════════════════════════════════════════════╝\n');
 
     await testConnection();
@@ -1193,6 +1240,7 @@ app.use((req, res) => {
       console.log('   GET  /api/cq/analises/:op');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
+      console.log(API_TOKEN ? '🔐 Segurança: rotas /api protegidas por token.\n' : '⚠️  Segurança: FACTORYFLOW_API_TOKEN não configurado. Rotas /api retornarão 503.\n');
     });
 
     startSync();
