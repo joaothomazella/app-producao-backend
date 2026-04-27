@@ -11,12 +11,24 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
 app.use(express.json({ limit: '2mb' }));
+const allowedOrigins = (process.env.CORS_ORIGIN || '')
+  .split(',')
+  .map(origin => origin.trim())
+  .filter(Boolean);
+
 app.use(cors({
-  origin: process.env.CORS_ORIGIN || '*',
+  origin: function (origin, callback) {
+    if (!origin) return callback(null, true); // permite Postman/testes
+
+    if (allowedOrigins.includes(origin)) {
+      return callback(null, true);
+    }
+
+    return callback(new Error('CORS bloqueado: origem não autorizada'));
+  },
   methods: ['GET', 'PATCH', 'POST', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }));
-
 function sendError(res, status, message, detail) {
   return res.status(status).json({
     ok: false,
