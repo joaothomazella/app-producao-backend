@@ -147,6 +147,7 @@ app.get('/', (req, res) => {
       'GET /api/cq/lotes/:op',
       'GET /api/cq/lote-resumo/:op',
       'POST /api/cq/analises',
+      'GET /api/cq/analises',
       'GET /api/cq/analises/:op',
       'GET /api/sync/status',
       'POST /api/sync/run'
@@ -1032,6 +1033,8 @@ app.post('/api/cq/analises', async (req, res) => {
       cliente_nome,
       produto_codigo,
       produto_nome,
+      linha_produto,
+      product_type,
       revisao,
       viscosidade_padrao,
       densidade_padrao,
@@ -1063,6 +1066,7 @@ app.post('/api/cq/analises', async (req, res) => {
           cliente_nome,
           produto_codigo,
           produto_nome,
+          linha_produto,
           revisao,
           viscosidade_padrao,
           densidade_padrao,
@@ -1078,7 +1082,7 @@ app.post('/api/cq/analises', async (req, res) => {
           data_analise,
           viscosidade_inicial,
           viscosidade_final
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       [
         op || null,
@@ -1087,6 +1091,7 @@ app.post('/api/cq/analises', async (req, res) => {
         cliente_nome || null,
         produto_codigo || null,
         produto_nome || null,
+        (linha_produto || product_type || null),
         revisao || null,
         viscosidade_padrao || null,
         densidade_padrao || null,
@@ -1143,6 +1148,112 @@ app.post('/api/cq/analises', async (req, res) => {
   } catch (err) {
     console.error('POST /api/cq/analises erro:', err.message);
     sendError(res, 500, 'Erro ao salvar análise', err.message);
+  }
+});
+
+
+app.get('/api/cq/analises', async (req, res) => {
+  try {
+    const limit = Math.min(toPositiveInt(req.query.limit, 500), 5000);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const search = req.query.search ? `%${req.query.search}%` : null;
+    const linha = req.query.linha || req.query.linha_produto || null;
+    const dateFrom = req.query.dateFrom || req.query.data_inicio || null;
+    const dateTo = req.query.dateTo || req.query.data_fim || null;
+
+    const conditions = [];
+    const params = [];
+
+    if (search) {
+      conditions.push(`
+        (
+          a.op LIKE ?
+          OR a.pedido LIKE ?
+          OR a.produto_codigo LIKE ?
+          OR a.produto_nome LIKE ?
+          OR a.cliente_nome LIKE ?
+          OR a.usuario LIKE ?
+        )
+      `);
+      params.push(search, search, search, search, search, search);
+    }
+
+    if (linha) {
+      conditions.push('a.linha_produto = ?');
+      params.push(linha);
+    }
+
+    if (dateFrom) {
+      conditions.push('a.data_analise >= ?');
+      params.push(dateFrom);
+    }
+
+    if (dateTo) {
+      conditions.push('a.data_analise <= ?');
+      params.push(dateTo);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [[{ total }]] = await dbPool.query(
+      `SELECT COUNT(*) AS total FROM cq_analises a ${where}`,
+      params
+    );
+
+    const [analises] = await dbPool.query(
+      `
+        SELECT
+          a.*,
+          COUNT(r.id) AS qtd_reajustes
+        FROM cq_analises a
+        LEFT JOIN cq_analises_reajustes r
+          ON r.analise_id = a.id
+        ${where}
+        GROUP BY a.id
+        ORDER BY COALESCE(a.data_analise, DATE(a.criado_em)) DESC, a.id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    if (!analises.length) {
+      return res.json({ ok: true, total: Number(total), limit, offset, data: [] });
+    }
+
+    const ids = analises.map(a => a.id);
+    const placeholders = ids.map(() => '?').join(',');
+
+    const [reajustes] = await dbPool.query(
+      `
+        SELECT *
+        FROM cq_analises_reajustes
+        WHERE analise_id IN (${placeholders})
+        ORDER BY analise_id ASC, numero_reajuste ASC, id ASC
+      `,
+      ids
+    );
+
+    const reajustesPorAnalise = new Map();
+    for (const r of reajustes) {
+      if (!reajustesPorAnalise.has(r.analise_id)) reajustesPorAnalise.set(r.analise_id, []);
+      reajustesPorAnalise.get(r.analise_id).push(r);
+    }
+
+    for (const analise of analises) {
+      analise.qtd_reajustes = Number(analise.qtd_reajustes || 0);
+      analise.reajustes = reajustesPorAnalise.get(analise.id) || [];
+    }
+
+    res.json({
+      ok: true,
+      total: Number(total),
+      limit,
+      offset,
+      data: analises
+    });
+  } catch (err) {
+    console.error('GET /api/cq/analises erro:', err.message);
+    sendError(res, 500, 'Erro ao listar histórico de análises', err.message);
   }
 });
 
@@ -1249,6 +1360,7 @@ app.use((req, res) => {
       console.log('   GET  /api/cq/lotes/:op');
       console.log('   GET  /api/cq/lote-resumo/:op');
       console.log('   POST /api/cq/analises');
+      console.log('   GET  /api/cq/analises');
       console.log('   GET  /api/cq/analises/:op');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
