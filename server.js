@@ -135,7 +135,6 @@ app.get('/', (req, res) => {
       'GET /api/stats',
       'GET /api/clientes',
       'GET /api/materias-primas/:codigo',
-      'GET /api/produtos',
       'GET /api/pedidos',
       'GET /api/pedidos/:numero',
       'PATCH /api/pedidos/:numero/processado',
@@ -332,6 +331,82 @@ app.get('/api/materias-primas/:codigo', async (req, res) => {
   } catch (err) {
     console.error('GET /api/materias-primas/:codigo erro:', err.message);
     sendError(res, 500, 'Erro ao buscar matéria-prima', err.message);
+  }
+});
+
+
+// =========================
+// PRODUTOS REAIS DA EMPRESA
+// =========================
+
+app.get('/api/produtos', async (req, res) => {
+  try {
+    const search = req.query.search ? `%${req.query.search}%` : null;
+    const limit = Math.min(toPositiveInt(req.query.limit, 500), 5000);
+    const offset = toPositiveInt(req.query.offset, 0);
+
+    const conditions = [];
+    const params = [];
+
+    if (search) {
+      conditions.push(`
+        (
+          pro_codigo LIKE ?
+          OR pro_nome LIKE ?
+          OR pro_grupo_nome LIKE ?
+          OR pro_linha LIKE ?
+        )
+      `);
+      params.push(search, search, search, search);
+    }
+
+    // Filtro final definido para a Induscolor:
+    // Entra: Endurecedor, Soluções, Testes e Pastas Internas.
+    // Sai: Matéria-prima, Solvente, Embalagens e Diversos.
+    conditions.push(`
+      COALESCE(pro_grupo_nome, '') NOT LIKE '%MATERIA%'
+      AND COALESCE(pro_grupo_nome, '') NOT LIKE '%MATÉRIA%'
+      AND COALESCE(pro_grupo_nome, '') NOT LIKE '%SOLVENTE%'
+      AND COALESCE(pro_grupo_nome, '') NOT LIKE '%EMBALAG%'
+      AND COALESCE(pro_grupo_nome, '') NOT LIKE '%DIVERSO%'
+    `);
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [[{ total }]] = await dbPool.query(
+      `SELECT COUNT(*) AS total FROM cli_produtos ${where}`,
+      params
+    );
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          pro_codigo AS id,
+          pro_codigo AS code,
+          pro_nome AS name,
+          pro_grupo AS grupo,
+          pro_grupo_nome AS grupo_nome,
+          COALESCE(NULLIF(TRIM(pro_linha), ''), pro_grupo_nome, 'Sem linha') AS type,
+          pro_linha AS linha,
+          1 AS active
+        FROM cli_produtos
+        ${where}
+        ORDER BY pro_nome ASC, pro_codigo ASC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      ok: true,
+      total: Number(total || 0),
+      limit,
+      offset,
+      data: rows,
+    });
+  } catch (err) {
+    console.error('GET /api/produtos erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar produtos reais da empresa', err.message);
   }
 });
 
@@ -1609,7 +1684,6 @@ app.use((req, res) => {
       console.log('   GET  /api/stats');
       console.log('   GET  /api/clientes');
       console.log('   GET  /api/materias-primas/:codigo');
-      console.log('   GET  /api/produtos');
       console.log('   GET  /api/pedidos');
       console.log('   GET  /api/pedidos/:numero');
       console.log('   PATCH /api/pedidos/:numero/processado');
