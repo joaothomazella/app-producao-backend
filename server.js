@@ -76,6 +76,105 @@ async function hasFactoryFlowProcessadoColumns() {
   return { hasFlag, hasDate, ok: hasFlag && hasDate };
 }
 
+
+async function ensureProductionLotesManualColumns() {
+  const hasProducaoLotes = await tableExists('producao_lotes');
+  if (!hasProducaoLotes) return;
+
+  const hasOrigem = await columnExists('producao_lotes', 'origem');
+  if (!hasOrigem) {
+    await dbPool.query(`
+      ALTER TABLE producao_lotes
+      ADD COLUMN origem VARCHAR(20) DEFAULT 'AUTO'
+    `);
+    console.log('✅ Coluna producao_lotes.origem criada.');
+  }
+
+  const hasLinhaProduto = await columnExists('producao_lotes', 'linha_produto');
+  if (!hasLinhaProduto) {
+    await dbPool.query(`
+      ALTER TABLE producao_lotes
+      ADD COLUMN linha_produto VARCHAR(100) NULL
+    `);
+    console.log('✅ Coluna producao_lotes.linha_produto criada.');
+  }
+}
+
+async function getProductionLoteByOp(op) {
+  const hasProducaoLotes = await tableExists('producao_lotes');
+  if (!hasProducaoLotes) return null;
+
+  const hasOrigem = await columnExists('producao_lotes', 'origem');
+  const hasLinhaProduto = await columnExists('producao_lotes', 'linha_produto');
+
+  const [rows] = await dbPool.query(
+    `
+      SELECT
+        id,
+        op,
+        numero_pedido,
+        cliente_codigo,
+        cliente_nome,
+        produto_codigo,
+        produto_nome,
+        quantidade,
+        tipo_lote,
+        prioridade,
+        status,
+        setor_atual,
+        classificado_pcp,
+        liberado_pcp,
+        ${hasLinhaProduto ? 'linha_produto' : 'NULL AS linha_produto'},
+        ${hasOrigem ? "COALESCE(NULLIF(TRIM(origem), ''), 'AUTO') AS origem" : "'AUTO' AS origem"},
+        data_criacao,
+        updated_at
+      FROM producao_lotes
+      WHERE TRIM(op) = TRIM(?)
+      ORDER BY id DESC
+      LIMIT 1
+    `,
+    [op]
+  );
+
+  return rows[0] || null;
+}
+
+async function getPedidoItemByOp(op) {
+  const [rows] = await dbPool.query(
+    `
+      SELECT
+        p.id,
+        p.pits_op,
+        p.pits_numero,
+        p.pits_cliente,
+        c.cli_nome AS nome_cliente,
+        p.pits_previsao,
+        p.pits_produto,
+        p.pits_nome_produto,
+        p.pits_qtde,
+        p.pits_peso,
+        p.pits_revisao,
+        p.pits_viscosidade,
+        p.pits_densidade,
+        p.pits_fineza,
+        c.cli_endereco,
+        c.cli_bairro,
+        c.cli_cidade,
+        c.cli_cep,
+        c.cli_estado
+      FROM cli_pedidos_itens p
+      LEFT JOIN cli_clientes c
+        ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+      WHERE TRIM(p.pits_op) = TRIM(?)
+      ORDER BY p.id ASC
+      LIMIT 1
+    `,
+    [op]
+  );
+
+  return rows[0] || null;
+}
+
 // =========================
 // SEGURANÇA - TOKEN/API KEY
 // =========================
@@ -128,7 +227,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.2.0-secure',
+    version: '2.3.0-lote-manual',
     timestamp: new Date().toISOString(),
     endpoints: [
       'GET /health',
@@ -143,6 +242,9 @@ app.get('/', (req, res) => {
       'GET /api/ops/:op',
       'GET /api/producao',
       'GET /api/producao/:id',
+      'POST /api/producao/manual',
+      'POST /api/lotes',
+      'GET /api/lote/:op',
       'PATCH /api/producao/:id',
       'GET /api/cq/lotes/:op',
       'GET /api/cq/lote-resumo/:op',
@@ -168,7 +270,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.2.0-secure',
+    version: '2.3.0-lote-manual',
     timestamp: new Date().toISOString(),
     sync: getSyncStats(),
   });
@@ -842,6 +944,172 @@ app.get('/api/ops/:op', async (req, res) => {
 // PRODUÇÃO (tabela interna)
 // =========================
 
+// =========================
+// PRODUÇÃO - LOTE MANUAL (FactoryFlow -> CQVision)
+// =========================
+
+async function criarLoteManual(req, res) {
+  try {
+    const hasProducaoLotes = await tableExists('producao_lotes');
+    if (!hasProducaoLotes) {
+      return sendError(
+        res,
+        404,
+        'Tabela producao_lotes não encontrada',
+        'Crie a tabela producao_lotes antes de criar lote manual.'
+      );
+    }
+
+    await ensureProductionLotesManualColumns();
+
+    const body = req.body || {};
+    const numeroPedido = String(body.numero_pedido || body.pedido || body.numero || '').trim();
+    const op = String(body.op || body.pits_op || '').trim();
+    const produtoCodigo = String(body.produto_codigo || body.codigo_produto || body.pits_produto || '').trim();
+    const produtoNome = String(body.produto_nome || body.nome_produto || body.pits_nome_produto || '').trim();
+    const clienteCodigo = String(body.cliente_codigo || body.codigo_cliente || body.pits_cliente || '').trim();
+    const clienteNome = String(body.cliente_nome || body.nome_cliente || body.cliente || '').trim();
+    const tipoLote = String(body.tipo_lote || body.tipo || 'manual').trim();
+    const linhaProduto = String(body.linha_produto || body.linha || body.product_type || '').trim();
+    const prioridade = String(body.prioridade || body.urgencia || 'normal').trim();
+    const setorAtual = String(body.setor_atual || body.setor || 'moagem').trim();
+    const status = String(body.status || 'aguardando').trim();
+    const quantidade = Number(body.quantidade ?? body.pits_qtde ?? body.qtd ?? 0) || 0;
+
+    if (!op) return sendError(res, 400, 'Informe a OP/lote');
+    if (!produtoNome && !produtoCodigo) return sendError(res, 400, 'Informe o produto');
+
+    const [duplicados] = await dbPool.query(
+      `SELECT id FROM producao_lotes WHERE TRIM(op) = TRIM(?) LIMIT 1`,
+      [op]
+    );
+
+    if (duplicados.length) {
+      return sendError(
+        res,
+        409,
+        'Já existe um lote com essa OP em produção',
+        `Lote existente ID ${duplicados[0].id}`
+      );
+    }
+
+    const [result] = await dbPool.query(
+      `
+        INSERT INTO producao_lotes (
+          numero_pedido,
+          op,
+          produto_codigo,
+          produto_nome,
+          tipo_lote,
+          quantidade,
+          cliente_codigo,
+          cliente_nome,
+          status,
+          prioridade,
+          classificado_pcp,
+          liberado_pcp,
+          setor_atual,
+          origem,
+          linha_produto
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?)
+      `,
+      [
+        numeroPedido || `MANUAL-${op}`,
+        op,
+        produtoCodigo,
+        produtoNome || produtoCodigo,
+        tipoLote,
+        quantidade,
+        clienteCodigo,
+        clienteNome,
+        status,
+        prioridade,
+        setorAtual,
+        linhaProduto
+      ]
+    );
+
+    const [rows] = await dbPool.query(
+      `SELECT * FROM producao_lotes WHERE id = ? LIMIT 1`,
+      [result.insertId]
+    );
+
+    return res.json({
+      ok: true,
+      message: 'Lote manual criado com sucesso',
+      data: rows[0]
+    });
+  } catch (err) {
+    console.error('POST /api/producao/manual erro:', err.message);
+    return sendError(res, 500, 'Erro ao criar lote manual', err.message);
+  }
+}
+
+app.post('/api/producao/manual', criarLoteManual);
+app.post('/api/lotes', criarLoteManual);
+
+app.get('/api/lote/:op', async (req, res) => {
+  try {
+    const { op } = req.params;
+
+    const lote = await getProductionLoteByOp(op);
+    if (lote) {
+      return res.json({
+        ok: true,
+        origem: 'producao_lotes',
+        data: {
+          op: lote.op,
+          pedido: lote.numero_pedido,
+          numero_pedido: lote.numero_pedido,
+          cliente_codigo: lote.cliente_codigo,
+          cliente_nome: lote.cliente_nome,
+          produto_codigo: lote.produto_codigo,
+          produto_nome: lote.produto_nome,
+          quantidade: lote.quantidade,
+          linha_produto: lote.linha_produto,
+          tipo_lote: lote.tipo_lote,
+          prioridade: lote.prioridade,
+          status: lote.status,
+          setor_atual: lote.setor_atual,
+          origem: lote.origem
+        }
+      });
+    }
+
+    const pedido = await getPedidoItemByOp(op);
+    if (pedido) {
+      return res.json({
+        ok: true,
+        origem: 'cli_pedidos_itens',
+        data: {
+          op: pedido.pits_op,
+          pedido: pedido.pits_numero,
+          numero_pedido: pedido.pits_numero,
+          cliente_codigo: pedido.pits_cliente,
+          cliente_nome: pedido.nome_cliente,
+          previsao: pedido.pits_previsao,
+          produto_codigo: pedido.pits_produto,
+          produto_nome: pedido.pits_nome_produto,
+          quantidade: pedido.pits_qtde,
+          peso: pedido.pits_peso,
+          revisao: pedido.pits_revisao,
+          viscosidade_padrao: pedido.pits_viscosidade,
+          densidade_padrao: pedido.pits_densidade,
+          fineza_padrao: pedido.pits_fineza,
+          linha_produto: null,
+          tipo_lote: null,
+          origem: 'AUTO'
+        }
+      });
+    }
+
+    return sendError(res, 404, 'Lote/OP não encontrado');
+  } catch (err) {
+    console.error('GET /api/lote/:op erro:', err.message);
+    return sendError(res, 500, 'Erro ao buscar lote por OP', err.message);
+  }
+});
+
 app.get('/api/producao', async (req, res) => {
   try {
     const hasProducaoLotes = await tableExists('producao_lotes');
@@ -996,6 +1264,51 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
   try {
     const { op } = req.params;
 
+    const loteManualOuProcessado = await getProductionLoteByOp(op);
+    if (loteManualOuProcessado) {
+      const row = loteManualOuProcessado;
+
+      return res.json({
+        ok: true,
+        origem: 'producao_lotes',
+        resumo: {
+          pits_op: row.op,
+          pits_numero: row.numero_pedido,
+          pits_cliente: row.cliente_codigo,
+          nome_cliente: row.cliente_nome,
+          pits_previsao: null,
+          total_registros: 1,
+        },
+        constantes: {
+          pits_viscosidade: null,
+          pits_densidade: null,
+          pits_fineza: null,
+          pits_revisao: null,
+        },
+        itens: [
+          {
+            id: row.id,
+            pits_op: row.op,
+            pits_numero: row.numero_pedido,
+            pits_cliente: row.cliente_codigo,
+            nome_cliente: row.cliente_nome,
+            pits_previsao: null,
+            pits_produto: row.produto_codigo,
+            pits_nome_produto: row.produto_nome,
+            pits_qtde: row.quantidade,
+            pits_peso: null,
+            pits_revisao: null,
+            pits_viscosidade: null,
+            pits_densidade: null,
+            pits_fineza: null,
+            linha_produto: row.linha_produto,
+            tipo_lote: row.tipo_lote,
+            origem: row.origem,
+          }
+        ],
+      });
+    }
+
     const [rows] = await dbPool.query(
       `
         SELECT
@@ -1012,11 +1325,12 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
           p.pits_revisao,
           p.pits_viscosidade,
           p.pits_densidade,
-          p.pits_fineza
+          p.pits_fineza,
+          'AUTO' AS origem
         FROM cli_pedidos_itens p
         LEFT JOIN cli_clientes c
           ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
-        WHERE p.pits_op = ?
+        WHERE TRIM(p.pits_op) = TRIM(?)
         ORDER BY p.id ASC
       `,
       [op]
@@ -1028,6 +1342,7 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
 
     res.json({
       ok: true,
+      origem: 'cli_pedidos_itens',
       resumo: {
         pits_op: rows[0].pits_op,
         pits_numero: rows[0].pits_numero,
@@ -1054,6 +1369,35 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
   try {
     const { op } = req.params;
 
+    const loteManualOuProcessado = await getProductionLoteByOp(op);
+    if (loteManualOuProcessado) {
+      const row = loteManualOuProcessado;
+
+      return res.json({
+        ok: true,
+        origem: 'producao_lotes',
+        data: {
+          op: row.op,
+          pedido: row.numero_pedido,
+          numero_pedido: row.numero_pedido,
+          cliente_codigo: row.cliente_codigo,
+          cliente_nome: row.cliente_nome,
+          previsao: null,
+          produto_codigo: row.produto_codigo,
+          produto_nome: row.produto_nome,
+          quantidade: row.quantidade,
+          peso: null,
+          revisao: null,
+          viscosidade_padrao: null,
+          densidade_padrao: null,
+          fineza_padrao: null,
+          linha_produto: row.linha_produto,
+          tipo_lote: row.tipo_lote,
+          origem: row.origem,
+        }
+      });
+    }
+
     const [rows] = await dbPool.query(
       `
         SELECT
@@ -1073,7 +1417,7 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
         FROM cli_pedidos_itens p
         LEFT JOIN cli_clientes c
           ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
-        WHERE p.pits_op = ?
+        WHERE TRIM(p.pits_op) = TRIM(?)
         LIMIT 1
       `,
       [op]
@@ -1087,9 +1431,11 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
 
     res.json({
       ok: true,
+      origem: 'cli_pedidos_itens',
       data: {
         op: row.pits_op,
         pedido: row.pits_numero,
+        numero_pedido: row.pits_numero,
         cliente_codigo: row.pits_cliente,
         cliente_nome: row.nome_cliente,
         previsao: row.pits_previsao,
@@ -1100,7 +1446,10 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
         revisao: row.pits_revisao,
         viscosidade_padrao: row.pits_viscosidade,
         densidade_padrao: row.pits_densidade,
-        fineza_padrao: row.pits_fineza
+        fineza_padrao: row.pits_fineza,
+        linha_produto: null,
+        tipo_lote: null,
+        origem: 'AUTO'
       }
     });
   } catch (err) {
@@ -2068,10 +2417,11 @@ app.use((req, res) => {
 (async () => {
   try {
     console.log('\n╔════════════════════════════════════════════════════╗');
-    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.2.0 SECURE    ║');
+    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.3.0 LOTE MANUAL    ║');
     console.log('╚════════════════════════════════════════════════════╝\n');
 
     await testConnection();
+    await ensureProductionLotesManualColumns();
 
     app.listen(PORT, () => {
       console.log(`🚀 API rodando em http://localhost:${PORT}\n`);
@@ -2089,6 +2439,9 @@ app.use((req, res) => {
       console.log('   GET  /api/ops/:op');
       console.log('   GET  /api/producao');
       console.log('   GET  /api/producao/:id');
+      console.log('   POST /api/producao/manual');
+      console.log('   POST /api/lotes');
+      console.log('   GET  /api/lote/:op');
       console.log('   PATCH /api/producao/:id');
       console.log('   GET  /api/cq/lotes/:op');
       console.log('   GET  /api/cq/lote-resumo/:op');
