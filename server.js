@@ -1501,10 +1501,21 @@ async function getCqProdutoHistorico(codigo, limit = 100) {
     `
       SELECT
         a.*,
-        COUNT(r.id) AS qtd_reajustes
+        COUNT(r.id) AS qtd_reajustes,
+        MAX(pinfo.total_quantidade) AS quantidade_total,
+        MAX(pinfo.total_peso) AS peso_total
       FROM cq_analises a
       LEFT JOIN cq_analises_reajustes r
         ON r.analise_id = a.id
+      LEFT JOIN (
+        SELECT
+          pits_op,
+          SUM(COALESCE(pits_qtde, 0)) AS total_quantidade,
+          SUM(COALESCE(pits_peso, 0)) AS total_peso
+        FROM cli_pedidos_itens
+        WHERE pits_op IS NOT NULL AND pits_op <> ''
+        GROUP BY pits_op
+      ) pinfo ON TRIM(pinfo.pits_op) = TRIM(a.op)
       WHERE TRIM(a.produto_codigo) = TRIM(?)
       GROUP BY a.id
       ORDER BY COALESCE(a.data_analise, DATE(a.criado_em)) DESC, a.id DESC
@@ -1519,10 +1530,15 @@ async function getCqProdutoHistorico(codigo, limit = 100) {
   const placeholders = ids.map(() => '?').join(',');
   const [reajustes] = await dbPool.query(
     `
-      SELECT *
-      FROM cq_analises_reajustes
-      WHERE analise_id IN (${placeholders})
-      ORDER BY analise_id ASC, numero_reajuste ASC, id ASC
+      SELECT
+        r.*,
+        COALESCE(mp.mp_custo, 0) AS mp_custo,
+        COALESCE(mp.mp_custo, 0) AS unit_cost
+      FROM cq_analises_reajustes r
+      LEFT JOIN cli_materia_prima mp
+        ON TRIM(mp.mp_codigo) = TRIM(r.materia_prima_codigo)
+      WHERE r.analise_id IN (${placeholders})
+      ORDER BY r.analise_id ASC, r.numero_reajuste ASC, r.id ASC
     `,
     ids
   );
@@ -1740,10 +1756,21 @@ app.get('/api/cq/analises', async (req, res) => {
       `
         SELECT
           a.*,
-          COUNT(r.id) AS qtd_reajustes
+          COUNT(r.id) AS qtd_reajustes,
+          MAX(pinfo.total_quantidade) AS quantidade_total,
+          MAX(pinfo.total_peso) AS peso_total
         FROM cq_analises a
         LEFT JOIN cq_analises_reajustes r
           ON r.analise_id = a.id
+        LEFT JOIN (
+          SELECT
+            pits_op,
+            SUM(COALESCE(pits_qtde, 0)) AS total_quantidade,
+            SUM(COALESCE(pits_peso, 0)) AS total_peso
+          FROM cli_pedidos_itens
+          WHERE pits_op IS NOT NULL AND pits_op <> ''
+          GROUP BY pits_op
+        ) pinfo ON TRIM(pinfo.pits_op) = TRIM(a.op)
         ${where}
         GROUP BY a.id
         ORDER BY COALESCE(a.data_analise, DATE(a.criado_em)) DESC, a.id DESC
@@ -1761,10 +1788,15 @@ app.get('/api/cq/analises', async (req, res) => {
 
     const [reajustes] = await dbPool.query(
       `
-        SELECT *
-        FROM cq_analises_reajustes
-        WHERE analise_id IN (${placeholders})
-        ORDER BY analise_id ASC, numero_reajuste ASC, id ASC
+        SELECT
+          r.*,
+          COALESCE(mp.mp_custo, 0) AS mp_custo,
+          COALESCE(mp.mp_custo, 0) AS unit_cost
+        FROM cq_analises_reajustes r
+        LEFT JOIN cli_materia_prima mp
+          ON TRIM(mp.mp_codigo) = TRIM(r.materia_prima_codigo)
+        WHERE r.analise_id IN (${placeholders})
+        ORDER BY r.analise_id ASC, r.numero_reajuste ASC, r.id ASC
       `,
       ids
     );
@@ -1799,10 +1831,22 @@ app.get('/api/cq/analises/:op', async (req, res) => {
 
     const [analises] = await dbPool.query(
       `
-        SELECT *
-        FROM cq_analises
-        WHERE op = ?
-        ORDER BY criado_em DESC, id DESC
+        SELECT
+          a.*,
+          pinfo.total_quantidade AS quantidade_total,
+          pinfo.total_peso AS peso_total
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT
+            pits_op,
+            SUM(COALESCE(pits_qtde, 0)) AS total_quantidade,
+            SUM(COALESCE(pits_peso, 0)) AS total_peso
+          FROM cli_pedidos_itens
+          WHERE pits_op IS NOT NULL AND pits_op <> ''
+          GROUP BY pits_op
+        ) pinfo ON TRIM(pinfo.pits_op) = TRIM(a.op)
+        WHERE a.op = ?
+        ORDER BY a.criado_em DESC, a.id DESC
       `,
       [op]
     );
@@ -1810,10 +1854,15 @@ app.get('/api/cq/analises/:op', async (req, res) => {
     for (const analise of analises) {
       const [reajustes] = await dbPool.query(
         `
-          SELECT *
-          FROM cq_analises_reajustes
-          WHERE analise_id = ?
-          ORDER BY numero_reajuste ASC, id ASC
+          SELECT
+            r.*,
+            COALESCE(mp.mp_custo, 0) AS mp_custo,
+            COALESCE(mp.mp_custo, 0) AS unit_cost
+          FROM cq_analises_reajustes r
+          LEFT JOIN cli_materia_prima mp
+            ON TRIM(mp.mp_codigo) = TRIM(r.materia_prima_codigo)
+          WHERE r.analise_id = ?
+          ORDER BY r.numero_reajuste ASC, r.id ASC
         `,
         [analise.id]
       );
