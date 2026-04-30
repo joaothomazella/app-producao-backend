@@ -149,6 +149,12 @@ app.get('/', (req, res) => {
       'POST /api/cq/analises',
       'GET /api/cq/analises',
       'GET /api/cq/analises/:op',
+      'GET /api/cq/dashboard/resumo',
+      'GET /api/cq/dashboard/linhas',
+      'GET /api/cq/dashboard/reajustes',
+      'GET /api/cq/dashboard/materias-primas',
+      'GET /api/cq/dashboard/historico',
+      'GET /api/cq/dashboard/produtos-criticos',
       'GET /api/sync/status',
       'POST /api/sync/run'
     ],
@@ -1152,6 +1158,260 @@ app.post('/api/cq/analises', async (req, res) => {
 });
 
 
+
+// =========================
+// CQ VISION - DASHBOARD
+// =========================
+
+function buildCqDashboardFilters(query) {
+  const conditions = [];
+  const params = [];
+
+  const linha = query.linha || query.linha_produto || null;
+  const dateFrom = query.dateFrom || query.data_inicio || null;
+  const dateTo = query.dateTo || query.data_fim || null;
+
+  if (linha) {
+    conditions.push('a.linha_produto = ?');
+    params.push(linha);
+  }
+
+  if (dateFrom) {
+    conditions.push('a.data_analise >= ?');
+    params.push(dateFrom);
+  }
+
+  if (dateTo) {
+    conditions.push('a.data_analise <= ?');
+    params.push(dateTo);
+  }
+
+  return {
+    where: conditions.length ? `WHERE ${conditions.join(' AND ')}` : '',
+    params
+  };
+}
+
+app.get('/api/cq/dashboard/resumo', async (req, res) => {
+  try {
+    const { where, params } = buildCqDashboardFilters(req.query);
+
+    const [[totais]] = await dbPool.query(
+      `
+        SELECT
+          COUNT(*) AS total_analises,
+          SUM(CASE WHEN UPPER(COALESCE(a.resultado, '')) IN ('APROVADO', 'APROVADA', 'OK', 'LIBERADO', 'LIBERADA') THEN 1 ELSE 0 END) AS aprovados,
+          SUM(CASE WHEN UPPER(COALESCE(a.resultado, '')) IN ('REPROVADO', 'REPROVADA', 'REAJUSTE') THEN 1 ELSE 0 END) AS reprovados,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) > 0 THEN 1 ELSE 0 END) AS com_reajuste,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) = 0 THEN 1 ELSE 0 END) AS sem_reajuste,
+          AVG(NULLIF(CAST(a.viscosidade_inicial AS DECIMAL(12,4)), 0)) AS media_viscosidade_inicial,
+          AVG(NULLIF(CAST(a.viscosidade_final AS DECIMAL(12,4)), 0)) AS media_viscosidade_final,
+          AVG(NULLIF(CAST(a.densidade_encontrada AS DECIMAL(12,4)), 0)) AS media_densidade,
+          AVG(NULLIF(CAST(a.solidos_a AS DECIMAL(12,4)), 0)) AS media_solidos_a,
+          AVG(NULLIF(CAST(a.solidos_ab AS DECIMAL(12,4)), 0)) AS media_solidos_ab
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT analise_id, COUNT(*) AS qtd_reajustes
+          FROM cq_analises_reajustes
+          GROUP BY analise_id
+        ) r ON r.analise_id = a.id
+        ${where}
+      `,
+      params
+    );
+
+    const total = Number(totais.total_analises || 0);
+    const comReajuste = Number(totais.com_reajuste || 0);
+    const semReajuste = Number(totais.sem_reajuste || 0);
+    const fpy = total ? (semReajuste / total) * 100 : 0;
+    const percentualReajuste = total ? (comReajuste / total) * 100 : 0;
+
+    res.json({
+      ok: true,
+      data: {
+        total_analises: total,
+        total: total,
+        aprovados: Number(totais.aprovados || 0),
+        reprovados: Number(totais.reprovados || 0),
+        com_reajuste: comReajuste,
+        sem_reajuste: semReajuste,
+        fpy: Number(fpy.toFixed(2)),
+        percentual_reajuste: Number(percentualReajuste.toFixed(2)),
+        media_viscosidade_inicial: totais.media_viscosidade_inicial === null ? null : Number(Number(totais.media_viscosidade_inicial).toFixed(2)),
+        media_viscosidade_final: totais.media_viscosidade_final === null ? null : Number(Number(totais.media_viscosidade_final).toFixed(2)),
+        media_densidade: totais.media_densidade === null ? null : Number(Number(totais.media_densidade).toFixed(4)),
+        media_solidos_a: totais.media_solidos_a === null ? null : Number(Number(totais.media_solidos_a).toFixed(2)),
+        media_solidos_ab: totais.media_solidos_ab === null ? null : Number(Number(totais.media_solidos_ab).toFixed(2))
+      }
+    });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/resumo erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar resumo do dashboard CQ', err.message);
+  }
+});
+
+app.get('/api/cq/dashboard/linhas', async (req, res) => {
+  try {
+    const { where, params } = buildCqDashboardFilters(req.query);
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          COALESCE(NULLIF(TRIM(a.linha_produto), ''), 'Sem linha') AS linha_produto,
+          COUNT(*) AS total,
+          SUM(CASE WHEN UPPER(COALESCE(a.resultado, '')) IN ('APROVADO', 'APROVADA', 'OK', 'LIBERADO', 'LIBERADA') THEN 1 ELSE 0 END) AS aprovados,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) > 0 THEN 1 ELSE 0 END) AS com_reajuste,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) = 0 THEN 1 ELSE 0 END) AS sem_reajuste,
+          ROUND((SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) = 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)) * 100, 2) AS fpy
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT analise_id, COUNT(*) AS qtd_reajustes
+          FROM cq_analises_reajustes
+          GROUP BY analise_id
+        ) r ON r.analise_id = a.id
+        ${where}
+        GROUP BY COALESCE(NULLIF(TRIM(a.linha_produto), ''), 'Sem linha')
+        ORDER BY total DESC
+      `,
+      params
+    );
+
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/linhas erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar dashboard CQ por linha', err.message);
+  }
+});
+
+app.get('/api/cq/dashboard/reajustes', async (req, res) => {
+  try {
+    const { where, params } = buildCqDashboardFilters(req.query);
+    const limit = Math.min(toPositiveInt(req.query.limit, 10), 50);
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          COALESCE(NULLIF(TRIM(r.motivo_reajuste), ''), 'Sem motivo informado') AS motivo_reajuste,
+          COUNT(*) AS total,
+          COUNT(DISTINCT r.analise_id) AS analises_afetadas
+        FROM cq_analises_reajustes r
+        INNER JOIN cq_analises a ON a.id = r.analise_id
+        ${where}
+        GROUP BY COALESCE(NULLIF(TRIM(r.motivo_reajuste), ''), 'Sem motivo informado')
+        ORDER BY total DESC
+        LIMIT ?
+      `,
+      [...params, limit]
+    );
+
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/reajustes erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar motivos de reajuste do dashboard CQ', err.message);
+  }
+});
+
+app.get('/api/cq/dashboard/materias-primas', async (req, res) => {
+  try {
+    const { where, params } = buildCqDashboardFilters(req.query);
+    const limit = Math.min(toPositiveInt(req.query.limit, 10), 50);
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          COALESCE(NULLIF(TRIM(r.materia_prima_codigo), ''), '-') AS materia_prima_codigo,
+          COALESCE(NULLIF(TRIM(r.materia_prima_nome), ''), 'Sem matéria-prima informada') AS materia_prima_nome,
+          COUNT(*) AS total_vezes,
+          SUM(COALESCE(CAST(r.materia_prima_qtd AS DECIMAL(12,4)), 0)) AS qtd_total
+        FROM cq_analises_reajustes r
+        INNER JOIN cq_analises a ON a.id = r.analise_id
+        ${where}
+        GROUP BY
+          COALESCE(NULLIF(TRIM(r.materia_prima_codigo), ''), '-'),
+          COALESCE(NULLIF(TRIM(r.materia_prima_nome), ''), 'Sem matéria-prima informada')
+        ORDER BY total_vezes DESC, qtd_total DESC
+        LIMIT ?
+      `,
+      [...params, limit]
+    );
+
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/materias-primas erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar matérias-primas ajustadas no dashboard CQ', err.message);
+  }
+});
+
+app.get('/api/cq/dashboard/historico', async (req, res) => {
+  try {
+    const { where, params } = buildCqDashboardFilters(req.query);
+    const limit = Math.min(toPositiveInt(req.query.limit, 30), 365);
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          DATE(COALESCE(a.data_analise, a.criado_em)) AS data,
+          COUNT(*) AS total,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) > 0 THEN 1 ELSE 0 END) AS com_reajuste,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) = 0 THEN 1 ELSE 0 END) AS sem_reajuste,
+          ROUND((SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) = 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)) * 100, 2) AS fpy
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT analise_id, COUNT(*) AS qtd_reajustes
+          FROM cq_analises_reajustes
+          GROUP BY analise_id
+        ) r ON r.analise_id = a.id
+        ${where}
+        GROUP BY DATE(COALESCE(a.data_analise, a.criado_em))
+        ORDER BY data DESC
+        LIMIT ?
+      `,
+      [...params, limit]
+    );
+
+    res.json({ ok: true, data: rows.reverse() });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/historico erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar histórico do dashboard CQ', err.message);
+  }
+});
+
+app.get('/api/cq/dashboard/produtos-criticos', async (req, res) => {
+  try {
+    const { where, params } = buildCqDashboardFilters(req.query);
+    const limit = Math.min(toPositiveInt(req.query.limit, 10), 50);
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          a.produto_codigo,
+          a.produto_nome,
+          COALESCE(NULLIF(TRIM(a.linha_produto), ''), 'Sem linha') AS linha_produto,
+          COUNT(*) AS total_analises,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) > 0 THEN 1 ELSE 0 END) AS com_reajuste,
+          ROUND((SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) > 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)) * 100, 2) AS percentual_reajuste
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT analise_id, COUNT(*) AS qtd_reajustes
+          FROM cq_analises_reajustes
+          GROUP BY analise_id
+        ) r ON r.analise_id = a.id
+        ${where}
+        GROUP BY a.produto_codigo, a.produto_nome, COALESCE(NULLIF(TRIM(a.linha_produto), ''), 'Sem linha')
+        HAVING total_analises >= 1
+        ORDER BY percentual_reajuste DESC, com_reajuste DESC, total_analises DESC
+        LIMIT ?
+      `,
+      [...params, limit]
+    );
+
+    res.json({ ok: true, data: rows });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/produtos-criticos erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar produtos críticos do dashboard CQ', err.message);
+  }
+});
+
 app.get('/api/cq/analises', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 500), 5000);
@@ -1362,6 +1622,12 @@ app.use((req, res) => {
       console.log('   POST /api/cq/analises');
       console.log('   GET  /api/cq/analises');
       console.log('   GET  /api/cq/analises/:op');
+      console.log('   GET  /api/cq/dashboard/resumo');
+      console.log('   GET  /api/cq/dashboard/linhas');
+      console.log('   GET  /api/cq/dashboard/reajustes');
+      console.log('   GET  /api/cq/dashboard/materias-primas');
+      console.log('   GET  /api/cq/dashboard/historico');
+      console.log('   GET  /api/cq/dashboard/produtos-criticos');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
       console.log(API_TOKEN ? '🔐 Segurança: rotas /api protegidas por token.\n' : '⚠️  Segurança: FACTORYFLOW_API_TOKEN não configurado. Rotas /api retornarão 503.\n');
