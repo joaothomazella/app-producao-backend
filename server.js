@@ -149,6 +149,7 @@ app.get('/', (req, res) => {
       'POST /api/cq/analises',
       'GET /api/cq/analises',
       'GET /api/cq/analises/:op',
+      'GET /api/cq/dashboard/dados',
       'GET /api/cq/dashboard/resumo',
       'GET /api/cq/dashboard/linhas',
       'GET /api/cq/dashboard/reajustes',
@@ -1704,6 +1705,153 @@ app.get('/api/cq/produtos/:codigo/previsao', async (req, res) => {
   }
 });
 
+
+// =========================
+// CQ VISION - DADOS CONSOLIDADOS PARA DASHBOARD / TV / RELATÓRIOS
+// =========================
+
+app.get('/api/cq/dashboard/dados', async (req, res) => {
+  try {
+    const limit = Math.min(toPositiveInt(req.query.limit, 5000), 10000);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const search = req.query.search ? `%${req.query.search}%` : null;
+    const linha = req.query.linha || req.query.linha_produto || null;
+    const dateFrom = req.query.dateFrom || req.query.data_inicio || null;
+    const dateTo = req.query.dateTo || req.query.data_fim || null;
+
+    const conditions = [];
+    const params = [];
+
+    if (search) {
+      conditions.push(`
+        (
+          a.op LIKE ?
+          OR a.pedido LIKE ?
+          OR a.produto_codigo LIKE ?
+          OR a.produto_nome LIKE ?
+          OR a.cliente_nome LIKE ?
+          OR a.usuario LIKE ?
+        )
+      `);
+      params.push(search, search, search, search, search, search);
+    }
+
+    if (linha) {
+      conditions.push('COALESCE(NULLIF(TRIM(a.linha_produto), \'\'), \'Sem linha\') = ?');
+      params.push(linha);
+    }
+
+    if (dateFrom) {
+      conditions.push('DATE(COALESCE(a.data_analise, a.criado_em)) >= ?');
+      params.push(dateFrom);
+    }
+
+    if (dateTo) {
+      conditions.push('DATE(COALESCE(a.data_analise, a.criado_em)) <= ?');
+      params.push(dateTo);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [[{ total }]] = await dbPool.query(
+      `SELECT COUNT(*) AS total FROM cq_analises a ${where}`,
+      params
+    );
+
+    const [analises] = await dbPool.query(
+      `
+        SELECT
+          a.id,
+          a.op,
+          a.pedido,
+          a.cliente_codigo,
+          a.cliente_nome,
+          a.produto_codigo,
+          a.produto_nome,
+          COALESCE(NULLIF(TRIM(a.linha_produto), ''), 'Sem linha') AS linha_produto,
+          a.revisao,
+          a.resultado,
+          a.usuario,
+          a.data_analise,
+          a.criado_em,
+          a.viscosidade_padrao,
+          a.densidade_padrao,
+          a.fineza_padrao,
+          a.viscosidade_inicial,
+          a.viscosidade_final,
+          a.viscosidade_encontrada,
+          a.densidade_encontrada,
+          a.fineza_encontrada,
+          a.solidos_a,
+          a.solidos_ab,
+          a.observacoes,
+          COALESCE(rc.qtd_reajustes, 0) AS qtd_reajustes,
+          COALESCE(pi.total_quantidade, 0) AS quantidade_total,
+          COALESCE(pi.total_peso, 0) AS peso_total
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT analise_id, COUNT(*) AS qtd_reajustes
+          FROM cq_analises_reajustes
+          GROUP BY analise_id
+        ) rc ON rc.analise_id = a.id
+        LEFT JOIN (
+          SELECT
+            pits_op,
+            SUM(COALESCE(pits_qtde, 0)) AS total_quantidade,
+            SUM(COALESCE(pits_peso, 0)) AS total_peso
+          FROM cli_pedidos_itens
+          WHERE pits_op IS NOT NULL AND pits_op <> ''
+          GROUP BY pits_op
+        ) pi ON TRIM(pi.pits_op) = TRIM(a.op)
+        ${where}
+        ORDER BY DATE(COALESCE(a.data_analise, a.criado_em)) DESC, a.id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    if (!analises.length) {
+      return res.json({ ok: true, total: Number(total || 0), limit, offset, data: [] });
+    }
+
+    const ids = analises.map(a => a.id);
+    const placeholders = ids.map(() => '?').join(',');
+
+    const [reajustes] = await dbPool.query(
+      `
+        SELECT
+          r.*,
+          COALESCE(mp.mp_custo, 0) AS mp_custo,
+          COALESCE(mp.mp_custo, 0) AS unit_cost
+        FROM cq_analises_reajustes r
+        LEFT JOIN cli_materia_prima mp
+          ON TRIM(mp.mp_codigo) = TRIM(r.materia_prima_codigo)
+        WHERE r.analise_id IN (${placeholders})
+        ORDER BY r.analise_id ASC, r.numero_reajuste ASC, r.id ASC
+      `,
+      ids
+    );
+
+    const map = new Map();
+    for (const r of reajustes) {
+      if (!map.has(r.analise_id)) map.set(r.analise_id, []);
+      map.get(r.analise_id).push(r);
+    }
+
+    for (const a of analises) {
+      a.qtd_reajustes = Number(a.qtd_reajustes || 0);
+      a.quantidade_total = Number(a.quantidade_total || 0);
+      a.peso_total = Number(a.peso_total || 0);
+      a.reajustes = map.get(a.id) || [];
+    }
+
+    res.json({ ok: true, total: Number(total || 0), limit, offset, data: analises });
+  } catch (err) {
+    console.error('GET /api/cq/dashboard/dados erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar dados consolidados do dashboard CQ', err.message);
+  }
+});
+
 app.get('/api/cq/analises', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 500), 5000);
@@ -1947,6 +2095,7 @@ app.use((req, res) => {
       console.log('   POST /api/cq/analises');
       console.log('   GET  /api/cq/analises');
       console.log('   GET  /api/cq/analises/:op');
+      console.log('   GET  /api/cq/dashboard/dados');
       console.log('   GET  /api/cq/dashboard/resumo');
       console.log('   GET  /api/cq/dashboard/linhas');
       console.log('   GET  /api/cq/dashboard/reajustes');
