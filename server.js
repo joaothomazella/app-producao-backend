@@ -155,6 +155,8 @@ app.get('/', (req, res) => {
       'GET /api/cq/dashboard/materias-primas',
       'GET /api/cq/dashboard/historico',
       'GET /api/cq/dashboard/produtos-criticos',
+      'GET /api/cq/produtos',
+      'GET /api/cq/produtos/:codigo/previsao',
       'GET /api/sync/status',
       'POST /api/sync/run'
     ],
@@ -1488,6 +1490,204 @@ app.get('/api/cq/dashboard/produtos-criticos', async (req, res) => {
   }
 });
 
+
+
+// =========================
+// CQ VISION - PRODUTOS LANÇADOS E PREVISÕES
+// =========================
+
+async function getCqProdutoHistorico(codigo, limit = 100) {
+  const [analises] = await dbPool.query(
+    `
+      SELECT
+        a.*,
+        COUNT(r.id) AS qtd_reajustes
+      FROM cq_analises a
+      LEFT JOIN cq_analises_reajustes r
+        ON r.analise_id = a.id
+      WHERE TRIM(a.produto_codigo) = TRIM(?)
+      GROUP BY a.id
+      ORDER BY COALESCE(a.data_analise, DATE(a.criado_em)) DESC, a.id DESC
+      LIMIT ?
+    `,
+    [codigo, limit]
+  );
+
+  if (!analises.length) return [];
+
+  const ids = analises.map(a => a.id);
+  const placeholders = ids.map(() => '?').join(',');
+  const [reajustes] = await dbPool.query(
+    `
+      SELECT *
+      FROM cq_analises_reajustes
+      WHERE analise_id IN (${placeholders})
+      ORDER BY analise_id ASC, numero_reajuste ASC, id ASC
+    `,
+    ids
+  );
+
+  const porAnalise = new Map();
+  for (const r of reajustes) {
+    if (!porAnalise.has(r.analise_id)) porAnalise.set(r.analise_id, []);
+    porAnalise.get(r.analise_id).push(r);
+  }
+
+  return analises.map(a => ({
+    ...a,
+    qtd_reajustes: Number(a.qtd_reajustes || 0),
+    reajustes: porAnalise.get(a.id) || []
+  }));
+}
+
+function buildCqProdutoPrevisaoPayload(codigo, historico) {
+  const total = historico.length;
+  const comReajuste = historico.filter(a => Number(a.qtd_reajustes || 0) > 0).length;
+  const semReajuste = total - comReajuste;
+  const totalReajustes = historico.reduce((sum, a) => sum + Number(a.qtd_reajustes || 0), 0);
+  const fpy = total ? (semReajuste / total) * 100 : 0;
+  const probReajuste = total ? (comReajuste / total) * 100 : 0;
+
+  const motivos = new Map();
+  const materias = new Map();
+
+  for (const a of historico) {
+    for (const r of (a.reajustes || [])) {
+      const motivo = (r.motivo_reajuste || 'Sem motivo informado').trim();
+      const mp = (r.materia_prima_nome || r.materia_prima_codigo || 'Sem matéria-prima informada').trim();
+      motivos.set(motivo, (motivos.get(motivo) || 0) + 1);
+      materias.set(mp, (materias.get(mp) || 0) + 1);
+    }
+  }
+
+  const topMotivos = [...motivos.entries()]
+    .map(([motivo, total]) => ({ motivo, total }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 5);
+
+  const topMaterias = [...materias.entries()]
+    .map(([materia_prima, total]) => ({ materia_prima, total }))
+    .sort((a, b) => b.total - a.total)
+    .slice(0, 5);
+
+  const ultimo = historico[0] || null;
+
+  return {
+    codigo,
+    produto_codigo: codigo,
+    produto_nome: ultimo?.produto_nome || null,
+    linha_produto: ultimo?.linha_produto || null,
+    total_analises: total,
+    total_reajustes: totalReajustes,
+    com_reajuste: comReajuste,
+    sem_reajuste: semReajuste,
+    fpy: Number(fpy.toFixed(2)),
+    probabilidade_reajuste: Number(probReajuste.toFixed(2)),
+    media_reajustes: total ? Number((totalReajustes / total).toFixed(2)) : 0,
+    ultimo_lote: ultimo,
+    top_motivos: topMotivos,
+    top_materias_primas: topMaterias,
+    historico
+  };
+}
+
+app.get('/api/cq/produtos', async (req, res) => {
+  try {
+    const search = req.query.search ? `%${req.query.search}%` : null;
+    const limit = Math.min(toPositiveInt(req.query.limit, 300), 2000);
+    const offset = toPositiveInt(req.query.offset, 0);
+
+    const conditions = [
+      `a.produto_codigo IS NOT NULL`,
+      `TRIM(a.produto_codigo) <> ''`
+    ];
+    const params = [];
+
+    if (search) {
+      conditions.push(`(a.produto_codigo LIKE ? OR a.produto_nome LIKE ? OR a.linha_produto LIKE ?)`);
+      params.push(search, search, search);
+    }
+
+    const where = `WHERE ${conditions.join(' AND ')}`;
+
+    const [[{ total }]] = await dbPool.query(
+      `
+        SELECT COUNT(*) AS total
+        FROM (
+          SELECT a.produto_codigo
+          FROM cq_analises a
+          ${where}
+          GROUP BY a.produto_codigo
+        ) x
+      `,
+      params
+    );
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          a.produto_codigo AS id,
+          a.produto_codigo AS code,
+          SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(TRIM(a.produto_nome), '') ORDER BY COALESCE(a.data_analise, DATE(a.criado_em)) DESC, a.id DESC SEPARATOR '||'), '||', 1) AS name,
+          SUBSTRING_INDEX(GROUP_CONCAT(NULLIF(TRIM(a.linha_produto), '') ORDER BY COALESCE(a.data_analise, DATE(a.criado_em)) DESC, a.id DESC SEPARATOR '||'), '||', 1) AS type,
+          COUNT(*) AS total_analises,
+          MAX(COALESCE(a.data_analise, DATE(a.criado_em))) AS ultima_analise,
+          COALESCE(SUM(r.qtd_reajustes), 0) AS total_reajustes,
+          SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) > 0 THEN 1 ELSE 0 END) AS lotes_com_reajuste,
+          ROUND((SUM(CASE WHEN COALESCE(r.qtd_reajustes, 0) = 0 THEN 1 ELSE 0 END) / NULLIF(COUNT(*), 0)) * 100, 2) AS fpy,
+          1 AS active
+        FROM cq_analises a
+        LEFT JOIN (
+          SELECT analise_id, COUNT(*) AS qtd_reajustes
+          FROM cq_analises_reajustes
+          GROUP BY analise_id
+        ) r ON r.analise_id = a.id
+        ${where}
+        GROUP BY a.produto_codigo
+        ORDER BY ultima_analise DESC, a.produto_codigo ASC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      ok: true,
+      total: Number(total || 0),
+      limit,
+      offset,
+      data: rows.map(row => ({
+        ...row,
+        name: row.name || 'Produto sem nome',
+        type: row.type || 'Sem linha',
+        total_analises: Number(row.total_analises || 0),
+        total_reajustes: Number(row.total_reajustes || 0),
+        lotes_com_reajuste: Number(row.lotes_com_reajuste || 0),
+        fpy: row.fpy === null ? null : Number(row.fpy)
+      }))
+    });
+  } catch (err) {
+    console.error('GET /api/cq/produtos erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar produtos lançados no CQVision', err.message);
+  }
+});
+
+app.get('/api/cq/produtos/:codigo/previsao', async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo || '').trim();
+    const limit = Math.min(toPositiveInt(req.query.limit, 100), 500);
+
+    if (!codigo) return sendError(res, 400, 'Informe o código do produto');
+
+    const historico = await getCqProdutoHistorico(codigo, limit);
+    const payload = buildCqProdutoPrevisaoPayload(codigo, historico);
+
+    res.json({ ok: true, data: payload });
+  } catch (err) {
+    console.error('GET /api/cq/produtos/:codigo/previsao erro:', err.message);
+    sendError(res, 500, 'Erro ao gerar previsão do produto no CQVision', err.message);
+  }
+});
+
 app.get('/api/cq/analises', async (req, res) => {
   try {
     const limit = Math.min(toPositiveInt(req.query.limit, 500), 5000);
@@ -1704,6 +1904,8 @@ app.use((req, res) => {
       console.log('   GET  /api/cq/dashboard/materias-primas');
       console.log('   GET  /api/cq/dashboard/historico');
       console.log('   GET  /api/cq/dashboard/produtos-criticos');
+      console.log('   GET  /api/cq/produtos');
+      console.log('   GET  /api/cq/produtos/:codigo/previsao');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
       console.log(API_TOKEN ? '🔐 Segurança: rotas /api protegidas por token.\n' : '⚠️  Segurança: FACTORYFLOW_API_TOKEN não configurado. Rotas /api retornarão 503.\n');
