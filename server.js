@@ -135,6 +135,7 @@ app.get('/', (req, res) => {
       'GET /api/stats',
       'GET /api/clientes',
       'GET /api/materias-primas/:codigo',
+      'GET /api/produtos',
       'GET /api/pedidos',
       'GET /api/pedidos/:numero',
       'PATCH /api/pedidos/:numero/processado',
@@ -1608,6 +1609,7 @@ app.use((req, res) => {
       console.log('   GET  /api/stats');
       console.log('   GET  /api/clientes');
       console.log('   GET  /api/materias-primas/:codigo');
+      console.log('   GET  /api/produtos');
       console.log('   GET  /api/pedidos');
       console.log('   GET  /api/pedidos/:numero');
       console.log('   PATCH /api/pedidos/:numero/processado');
