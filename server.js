@@ -26,7 +26,7 @@ app.use(cors({
 
     return callback(new Error('CORS bloqueado: origem não autorizada'));
   },
-  methods: ['GET', 'PATCH', 'POST', 'OPTIONS'],
+  methods: ['GET', 'PATCH', 'POST', 'PUT', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }));
 function sendError(res, status, message, detail) {
@@ -250,6 +250,8 @@ app.get('/', (req, res) => {
       'GET /api/cq/lote-resumo/:op',
       'POST /api/cq/analises',
       'GET /api/cq/analises',
+      'GET /api/cq/analise/:id',
+      'PUT /api/cq/analises/:id',
       'GET /api/cq/analises/:op',
       'GET /api/cq/dashboard/dados',
       'GET /api/cq/dashboard/resumo',
@@ -1582,6 +1584,210 @@ app.post('/api/cq/analises', async (req, res) => {
   } catch (err) {
     console.error('POST /api/cq/analises erro:', err.message);
     sendError(res, 500, 'Erro ao salvar análise', err.message);
+  }
+});
+
+async function getCqAnaliseCompletaById(id) {
+  const [analises] = await dbPool.query(
+    `
+      SELECT *
+      FROM cq_analises
+      WHERE id = ?
+      LIMIT 1
+    `,
+    [id]
+  );
+
+  if (!analises.length) return null;
+
+  const analise = analises[0];
+
+  const [reajustes] = await dbPool.query(
+    `
+      SELECT
+        r.*,
+        COALESCE(mp.mp_custo, 0) AS mp_custo,
+        COALESCE(mp.mp_custo, 0) AS unit_cost
+      FROM cq_analises_reajustes r
+      LEFT JOIN cli_materia_prima mp
+        ON TRIM(mp.mp_codigo) = TRIM(r.materia_prima_codigo)
+      WHERE r.analise_id = ?
+      ORDER BY r.numero_reajuste ASC, r.id ASC
+    `,
+    [id]
+  );
+
+  analise.reajustes = reajustes;
+  analise.qtd_reajustes = reajustes.length;
+
+  return analise;
+}
+
+app.get('/api/cq/analise/:id', async (req, res) => {
+  try {
+    const id = toPositiveInt(req.params.id, 0);
+
+    if (!id) {
+      return sendError(res, 400, 'ID da análise inválido');
+    }
+
+    const analise = await getCqAnaliseCompletaById(id);
+
+    if (!analise) {
+      return sendError(res, 404, 'Análise não encontrada');
+    }
+
+    res.json({
+      ok: true,
+      data: analise
+    });
+  } catch (err) {
+    console.error('GET /api/cq/analise/:id erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar análise', err.message);
+  }
+});
+
+app.put('/api/cq/analises/:id', async (req, res) => {
+  try {
+    const id = toPositiveInt(req.params.id, 0);
+
+    if (!id) {
+      return sendError(res, 400, 'ID da análise inválido');
+    }
+
+    const {
+      op,
+      pedido,
+      cliente_codigo,
+      cliente_nome,
+      produto_codigo,
+      produto_nome,
+      linha_produto,
+      product_type,
+      revisao,
+      viscosidade_padrao,
+      densidade_padrao,
+      fineza_padrao,
+      viscosidade_encontrada,
+      densidade_encontrada,
+      fineza_encontrada,
+      solidos_a,
+      solidos_ab,
+      observacoes,
+      resultado,
+      usuario,
+      reajustes,
+      data_analise,
+      viscosidade_inicial,
+      viscosidade_final
+    } = req.body || {};
+
+    if (!op) {
+      return sendError(res, 400, 'Informe a OP');
+    }
+
+    const [result] = await dbPool.query(
+      `
+        UPDATE cq_analises
+        SET
+          op = ?,
+          pedido = ?,
+          cliente_codigo = ?,
+          cliente_nome = ?,
+          produto_codigo = ?,
+          produto_nome = ?,
+          linha_produto = ?,
+          revisao = ?,
+          viscosidade_padrao = ?,
+          densidade_padrao = ?,
+          fineza_padrao = ?,
+          viscosidade_encontrada = ?,
+          densidade_encontrada = ?,
+          fineza_encontrada = ?,
+          solidos_a = ?,
+          solidos_ab = ?,
+          observacoes = ?,
+          resultado = ?,
+          usuario = ?,
+          data_analise = ?,
+          viscosidade_inicial = ?,
+          viscosidade_final = ?
+        WHERE id = ?
+      `,
+      [
+        op || null,
+        pedido || null,
+        cliente_codigo || null,
+        cliente_nome || null,
+        produto_codigo || null,
+        produto_nome || null,
+        (linha_produto || product_type || null),
+        revisao || null,
+        viscosidade_padrao || null,
+        densidade_padrao || null,
+        fineza_padrao || null,
+        viscosidade_encontrada || null,
+        densidade_encontrada || null,
+        fineza_encontrada || null,
+        solidos_a || null,
+        solidos_ab || null,
+        observacoes || null,
+        resultado || null,
+        usuario || null,
+        data_analise || new Date().toISOString().slice(0, 10),
+        viscosidade_inicial || null,
+        viscosidade_final || null,
+        id
+      ]
+    );
+
+    if (!result.affectedRows) {
+      return sendError(res, 404, 'Análise não encontrada');
+    }
+
+    await dbPool.query(
+      `DELETE FROM cq_analises_reajustes WHERE analise_id = ?`,
+      [id]
+    );
+
+    if (Array.isArray(reajustes) && reajustes.length > 0) {
+      for (const reajuste of reajustes) {
+        await dbPool.query(
+          `
+            INSERT INTO cq_analises_reajustes (
+              analise_id,
+              numero_reajuste,
+              materia_prima_codigo,
+              materia_prima_nome,
+              materia_prima_qtd,
+              motivo_reajuste,
+              observacao_reajuste
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+          `,
+          [
+            id,
+            reajuste.numero_reajuste || 1,
+            reajuste.materia_prima_codigo || null,
+            reajuste.materia_prima_nome || null,
+            reajuste.materia_prima_qtd || null,
+            reajuste.motivo_reajuste || null,
+            reajuste.observacao_reajuste || null
+          ]
+        );
+      }
+    }
+
+    const analiseAtualizada = await getCqAnaliseCompletaById(id);
+
+    res.json({
+      ok: true,
+      id,
+      data: analiseAtualizada,
+      message: 'Análise atualizada com sucesso'
+    });
+  } catch (err) {
+    console.error('PUT /api/cq/analises/:id erro:', err.message);
+    sendError(res, 500, 'Erro ao atualizar análise', err.message);
   }
 });
 
