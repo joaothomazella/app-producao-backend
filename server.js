@@ -1443,7 +1443,7 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
         previsao: row.pits_previsao,
         produto_codigo: row.pits_produto,
         produto_nome: row.pits_nome_produto,
-        quantidade: row.pits_qtde,
+        quantidade: Number(row.pits_peso || row.pits_qtde || 0),
         peso: row.pits_peso,
         revisao: row.pits_revisao,
         viscosidade_padrao: row.pits_viscosidade,
