@@ -2608,6 +2608,337 @@ app.post('/api/sync/run', async (req, res) => {
   }
 });
 
+
+// =========================
+// FACTORYFLOW APP - TABELAS GENÉRICAS PARA DRIVER.HTML
+// =========================
+// Estas rotas resolvem chamadas do frontend antigo/mobile:
+// GET  /api/tables/ff_routes
+// PUT  /api/tables/ff_routes/:id
+// GET  /api/tables/ff_lots
+// PUT  /api/tables/ff_lots/:id
+// Também suportam ff_orders e ff_users caso alguma tela antiga use.
+
+const FF_TABLES = {
+  ff_routes: {
+    createSql: `
+      CREATE TABLE IF NOT EXISTS ff_routes (
+        id VARCHAR(100) PRIMARY KEY,
+        driverId VARCHAR(100) NULL,
+        driverName VARCHAR(150) NULL,
+        lots LONGTEXT NULL,
+        status VARCHAR(50) DEFAULT 'active',
+        createdAt BIGINT NULL,
+        departureTime BIGINT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `,
+    columns: ['id','driverId','driverName','lots','status','createdAt','departureTime']
+  },
+  ff_lots: {
+    createSql: `
+      CREATE TABLE IF NOT EXISTS ff_lots (
+        id VARCHAR(100) PRIMARY KEY,
+        number VARCHAR(100) NULL,
+        orderId VARCHAR(100) NULL,
+        orderNumber VARCHAR(100) NULL,
+        client VARCHAR(255) NULL,
+        productCode VARCHAR(100) NULL,
+        paint VARCHAR(255) NULL,
+        productType VARCHAR(100) NULL,
+        endurecedorRoute VARCHAR(100) NULL,
+        destinoEndurecedor VARCHAR(100) NULL,
+        qty DECIMAL(14,4) DEFAULT 0,
+        unit VARCHAR(30) DEFAULT 'Kg',
+        priority VARCHAR(50) DEFAULT 'normal',
+        deliveryDate VARCHAR(50) NULL,
+        skipColor VARCHAR(20) NULL,
+        city VARCHAR(150) NULL,
+        address VARCHAR(255) NULL,
+        notes LONGTEXT NULL,
+        sector VARCHAR(100) NULL,
+        lotStatus VARCHAR(50) NULL,
+        workSessions LONGTEXT NULL,
+        sectorEnteredAt BIGINT NULL,
+        createdAt BIGINT NULL,
+        createdBy VARCHAR(100) NULL,
+        rejected VARCHAR(20) NULL,
+        rejectedAt BIGINT NULL,
+        rejectedReason LONGTEXT NULL,
+        rejectedBy VARCHAR(100) NULL,
+        rejectedSector VARCHAR(100) NULL,
+        history LONGTEXT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `,
+    columns: [
+      'id','number','orderId','orderNumber','client','productCode','paint','productType',
+      'endurecedorRoute','destinoEndurecedor','qty','unit','priority','deliveryDate','skipColor',
+      'city','address','notes','sector','lotStatus','workSessions','sectorEnteredAt','createdAt',
+      'createdBy','rejected','rejectedAt','rejectedReason','rejectedBy','rejectedSector','history'
+    ]
+  },
+  ff_orders: {
+    createSql: `
+      CREATE TABLE IF NOT EXISTS ff_orders (
+        id VARCHAR(100) PRIMARY KEY,
+        number VARCHAR(100) NULL,
+        client VARCHAR(255) NULL,
+        city VARCHAR(150) NULL,
+        address VARCHAR(255) NULL,
+        deliveryDate VARCHAR(50) NULL,
+        priority VARCHAR(50) DEFAULT 'normal',
+        notes LONGTEXT NULL,
+        status VARCHAR(50) NULL,
+        createdAt BIGINT NULL,
+        createdBy VARCHAR(100) NULL,
+        lotIds LONGTEXT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `,
+    columns: ['id','number','client','city','address','deliveryDate','priority','notes','status','createdAt','createdBy','lotIds']
+  },
+  ff_users: {
+    createSql: `
+      CREATE TABLE IF NOT EXISTS ff_users (
+        id VARCHAR(100) PRIMARY KEY,
+        name VARCHAR(150) NULL,
+        login VARCHAR(100) NULL,
+        password VARCHAR(255) NULL,
+        role VARCHAR(50) NULL,
+        active VARCHAR(20) DEFAULT 'true',
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `,
+    columns: ['id','name','login','password','role','active']
+  }
+};
+
+function isSafeColumnName(name) {
+  return /^[a-zA-Z_][a-zA-Z0-9_]*$/.test(String(name || ''));
+}
+
+function normalizeTablePayload(value) {
+  if (value === undefined) return null;
+  if (value === null) return null;
+  if (typeof value === 'object') return JSON.stringify(value);
+  if (typeof value === 'boolean') return value ? 'true' : 'false';
+  return value;
+}
+
+async function ensureFfTable(tableName) {
+  const cfg = FF_TABLES[tableName];
+  if (!cfg) return false;
+  await dbPool.query(cfg.createSql);
+  return true;
+}
+
+async function getExistingColumns(tableName) {
+  const [cols] = await dbPool.query(`SHOW COLUMNS FROM \`${tableName}\``);
+  return new Set(cols.map(c => c.Field));
+}
+
+async function ensureColumnsForPayload(tableName, payload) {
+  const cfg = FF_TABLES[tableName];
+  if (!cfg) return;
+
+  const existing = await getExistingColumns(tableName);
+  const allowed = new Set(cfg.columns);
+
+  for (const key of Object.keys(payload || {})) {
+    if (!isSafeColumnName(key)) continue;
+    if (existing.has(key)) continue;
+    if (!allowed.has(key)) continue;
+
+    await dbPool.query(`ALTER TABLE \`${tableName}\` ADD COLUMN \`${key}\` LONGTEXT NULL`);
+    existing.add(key);
+    console.log(`✅ Coluna ${tableName}.${key} criada automaticamente.`);
+  }
+}
+
+function pickAllowedPayload(tableName, payload) {
+  const cfg = FF_TABLES[tableName];
+  const allowed = new Set(cfg.columns);
+  const out = {};
+
+  for (const [key, value] of Object.entries(payload || {})) {
+    if (!allowed.has(key)) continue;
+    if (!isSafeColumnName(key)) continue;
+    out[key] = normalizeTablePayload(value);
+  }
+
+  return out;
+}
+
+function normalizeGenericRow(row) {
+  if (!row) return row;
+  const out = { ...row };
+
+  for (const key of ['lots','history','workSessions','lotIds']) {
+    if (typeof out[key] === 'string' && out[key].trim()) {
+      try { out[key] = JSON.parse(out[key]); } catch (_) {}
+    }
+  }
+
+  return out;
+}
+
+async function listGenericTable(req, res) {
+  try {
+    const tableName = req.params.table;
+    if (!FF_TABLES[tableName]) return sendError(res, 404, `Tabela não liberada: ${tableName}`);
+
+    await ensureFfTable(tableName);
+
+    const limit = Math.min(toPositiveInt(req.query.limit, 500), 2000);
+    const offset = toPositiveInt(req.query.offset, 0);
+
+    const existing = await getExistingColumns(tableName);
+    const orderCol = existing.has('createdAt') ? 'createdAt' : 'id';
+
+    const [[{ total }]] = await dbPool.query(`SELECT COUNT(*) AS total FROM \`${tableName}\``);
+    const [rows] = await dbPool.query(
+      `SELECT * FROM \`${tableName}\` ORDER BY \`${orderCol}\` DESC LIMIT ? OFFSET ?`,
+      [limit, offset]
+    );
+
+    res.json({
+      ok: true,
+      total: Number(total || 0),
+      limit,
+      offset,
+      data: rows.map(normalizeGenericRow)
+    });
+  } catch (err) {
+    console.error(`GET /tables/${req.params.table} erro:`, err.message);
+    sendError(res, 500, 'Erro ao listar tabela FactoryFlow', err.message);
+  }
+}
+
+async function getGenericTableRow(req, res) {
+  try {
+    const tableName = req.params.table;
+    const id = req.params.id;
+    if (!FF_TABLES[tableName]) return sendError(res, 404, `Tabela não liberada: ${tableName}`);
+
+    await ensureFfTable(tableName);
+
+    const [rows] = await dbPool.query(
+      `SELECT * FROM \`${tableName}\` WHERE id = ? LIMIT 1`,
+      [id]
+    );
+
+    if (!rows.length) return sendError(res, 404, 'Registro não encontrado');
+    res.json({ ok: true, data: normalizeGenericRow(rows[0]) });
+  } catch (err) {
+    console.error(`GET /tables/${req.params.table}/${req.params.id} erro:`, err.message);
+    sendError(res, 500, 'Erro ao buscar registro FactoryFlow', err.message);
+  }
+}
+
+async function createGenericTableRow(req, res) {
+  try {
+    const tableName = req.params.table;
+    if (!FF_TABLES[tableName]) return sendError(res, 404, `Tabela não liberada: ${tableName}`);
+
+    await ensureFfTable(tableName);
+
+    const payload = pickAllowedPayload(tableName, req.body || {});
+    if (!payload.id) payload.id = `${tableName}_${Date.now()}`;
+
+    await ensureColumnsForPayload(tableName, payload);
+
+    const columns = Object.keys(payload);
+    const placeholders = columns.map(() => '?').join(', ');
+    const values = columns.map(c => payload[c]);
+
+    await dbPool.query(
+      `INSERT INTO \`${tableName}\` (${columns.map(c => `\`${c}\``).join(', ')}) VALUES (${placeholders})`,
+      values
+    );
+
+    const [rows] = await dbPool.query(`SELECT * FROM \`${tableName}\` WHERE id = ? LIMIT 1`, [payload.id]);
+    res.json({ ok: true, data: normalizeGenericRow(rows[0] || payload) });
+  } catch (err) {
+    console.error(`POST /tables/${req.params.table} erro:`, err.message);
+    sendError(res, 500, 'Erro ao criar registro FactoryFlow', err.message);
+  }
+}
+
+async function updateGenericTableRow(req, res) {
+  try {
+    const tableName = req.params.table;
+    const id = req.params.id;
+    if (!FF_TABLES[tableName]) return sendError(res, 404, `Tabela não liberada: ${tableName}`);
+
+    await ensureFfTable(tableName);
+
+    const payload = pickAllowedPayload(tableName, req.body || {});
+    delete payload.id;
+
+    await ensureColumnsForPayload(tableName, payload);
+
+    const columns = Object.keys(payload);
+    if (!columns.length) return sendError(res, 400, 'Nenhum campo válido para atualizar');
+
+    const sets = columns.map(c => `\`${c}\` = ?`).join(', ');
+    const values = columns.map(c => payload[c]);
+    values.push(id);
+
+    const [result] = await dbPool.query(
+      `UPDATE \`${tableName}\` SET ${sets} WHERE id = ?`,
+      values
+    );
+
+    if (!result.affectedRows) {
+      const insertPayload = { id, ...payload };
+      const insertColumns = Object.keys(insertPayload);
+      const placeholders = insertColumns.map(() => '?').join(', ');
+      await dbPool.query(
+        `INSERT INTO \`${tableName}\` (${insertColumns.map(c => `\`${c}\``).join(', ')}) VALUES (${placeholders})`,
+        insertColumns.map(c => insertPayload[c])
+      );
+    }
+
+    const [rows] = await dbPool.query(`SELECT * FROM \`${tableName}\` WHERE id = ? LIMIT 1`, [id]);
+    res.json({ ok: true, data: normalizeGenericRow(rows[0]) });
+  } catch (err) {
+    console.error(`PUT/PATCH /tables/${req.params.table}/${req.params.id} erro:`, err.message);
+    sendError(res, 500, 'Erro ao atualizar registro FactoryFlow', err.message);
+  }
+}
+
+async function deleteGenericTableRow(req, res) {
+  try {
+    const tableName = req.params.table;
+    const id = req.params.id;
+    if (!FF_TABLES[tableName]) return sendError(res, 404, `Tabela não liberada: ${tableName}`);
+
+    await ensureFfTable(tableName);
+
+    const [result] = await dbPool.query(`DELETE FROM \`${tableName}\` WHERE id = ?`, [id]);
+    res.json({ ok: true, affectedRows: result.affectedRows });
+  } catch (err) {
+    console.error(`DELETE /tables/${req.params.table}/${req.params.id} erro:`, err.message);
+    sendError(res, 500, 'Erro ao excluir registro FactoryFlow', err.message);
+  }
+}
+
+app.get('/tables/:table', listGenericTable);
+app.get('/tables/:table/:id', getGenericTableRow);
+app.post('/tables/:table', createGenericTableRow);
+app.put('/tables/:table/:id', updateGenericTableRow);
+app.patch('/tables/:table/:id', updateGenericTableRow);
+app.delete('/tables/:table/:id', deleteGenericTableRow);
+
+// Alias com /api/tables caso algum frontend esteja configurado assim.
+app.get('/api/tables/:table', listGenericTable);
+app.get('/api/tables/:table/:id', getGenericTableRow);
+app.post('/api/tables/:table', createGenericTableRow);
+app.put('/api/tables/:table/:id', updateGenericTableRow);
+app.patch('/api/tables/:table/:id', updateGenericTableRow);
+app.delete('/api/tables/:table/:id', deleteGenericTableRow);
+
 // =========================
 // 404
 // =========================
