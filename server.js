@@ -517,6 +517,42 @@ app.get('/api/produtos', async (req, res) => {
   }
 });
 
+
+// =========================
+// MOTORISTAS (USERS CENTRAL)
+// =========================
+
+app.get('/api/motoristas', async (req, res) => {
+  try {
+    const [rows] = await dbPool.query(`
+      SELECT
+        id,
+        COALESCE(NULLIF(TRIM(nome), ''), NULLIF(TRIM(usuario), ''), CONCAT('Motorista ', id)) AS name,
+        usuario AS login,
+        role,
+        acesso_factoryflow,
+        ativo
+      FROM users
+      WHERE COALESCE(ativo, 1) = 1
+        AND (
+          LOWER(COALESCE(role, '')) IN ('driver', 'motorista')
+          OR LOWER(COALESCE(acesso_factoryflow, '')) IN ('driver', 'motorista')
+          OR LOWER(COALESCE(acesso_factoryflow, '')) LIKE '%motor%'
+        )
+      ORDER BY name ASC
+    `);
+
+    res.json({
+      ok: true,
+      total: rows.length,
+      data: rows,
+    });
+  } catch (err) {
+    console.error('GET /api/motoristas erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar motoristas', err.message);
+  }
+});
+
 // =========================
 // FACTORYFLOW - PEDIDOS
 // =========================
