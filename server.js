@@ -26,7 +26,7 @@ app.use(cors({
 
     return callback(new Error('CORS bloqueado: origem não autorizada'));
   },
-  methods: ['GET', 'PATCH', 'POST', 'PUT', 'OPTIONS'],
+  methods: ['GET', 'PATCH', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
   allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
 }));
 function sendError(res, status, message, detail) {
@@ -100,12 +100,76 @@ async function ensureProductionLotesManualColumns() {
   }
 }
 
+
+async function ensureSectorShiftTable() {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_sector_shifts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      setor VARCHAR(80) NOT NULL UNIQUE,
+      expediente_aberto TINYINT DEFAULT 0,
+      iniciado_em DATETIME NULL,
+      finalizado_em DATETIME NULL,
+      atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+async function ensureProductionLotesTimeColumns() {
+  const hasProducaoLotes = await tableExists('producao_lotes');
+  if (!hasProducaoLotes) return;
+
+  const columns = [
+    {
+      name: 'ff_lotStatus',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_lotStatus VARCHAR(50) NULL`
+    },
+    {
+      name: 'ff_sectorEnteredAt',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_sectorEnteredAt BIGINT NULL`
+    },
+    {
+      name: 'ff_workSessions',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_workSessions LONGTEXT NULL`
+    },
+    {
+      name: 'ff_expedientePausedStatus',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_expedientePausedStatus VARCHAR(50) NULL`
+    }
+  ];
+
+  for (const col of columns) {
+    const exists = await columnExists('producao_lotes', col.name);
+    if (!exists) {
+      await dbPool.query(col.sql);
+      console.log(`✅ Coluna producao_lotes.${col.name} criada.`);
+    }
+  }
+}
+
+function normalizeShiftSetor(setor) {
+  const s = String(setor || '').trim().toLowerCase();
+  const map = {
+    coloracao_revisao: 'coloracao',
+    coloracao_amostras: 'coloracao',
+    laboratorio_revisao: 'laboratorio',
+    laboratorio_amostras: 'laboratorio',
+    envase_produzir: 'envase',
+    envase_enlatamento: 'envase',
+    envase: 'envase'
+  };
+  return map[s] || s;
+}
+
 async function getProductionLoteByOp(op) {
   const hasProducaoLotes = await tableExists('producao_lotes');
   if (!hasProducaoLotes) return null;
 
   const hasOrigem = await columnExists('producao_lotes', 'origem');
   const hasLinhaProduto = await columnExists('producao_lotes', 'linha_produto');
+  const hasFfLotStatus = await columnExists('producao_lotes', 'ff_lotStatus');
+  const hasFfSectorEnteredAt = await columnExists('producao_lotes', 'ff_sectorEnteredAt');
+  const hasFfWorkSessions = await columnExists('producao_lotes', 'ff_workSessions');
+  const hasFfExpedientePausedStatus = await columnExists('producao_lotes', 'ff_expedientePausedStatus');
 
   const [rows] = await dbPool.query(
     `
@@ -126,6 +190,10 @@ async function getProductionLoteByOp(op) {
         liberado_pcp,
         ${hasLinhaProduto ? 'linha_produto' : 'NULL AS linha_produto'},
         ${hasOrigem ? "COALESCE(NULLIF(TRIM(origem), ''), 'AUTO') AS origem" : "'AUTO' AS origem"},
+        ${hasFfLotStatus ? 'ff_lotStatus' : 'NULL AS ff_lotStatus'},
+        ${hasFfSectorEnteredAt ? 'ff_sectorEnteredAt' : 'NULL AS ff_sectorEnteredAt'},
+        ${hasFfWorkSessions ? 'ff_workSessions' : 'NULL AS ff_workSessions'},
+        ${hasFfExpedientePausedStatus ? 'ff_expedientePausedStatus' : 'NULL AS ff_expedientePausedStatus'},
         data_criacao,
         updated_at
       FROM producao_lotes
@@ -227,7 +295,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.3.0-lote-manual',
+    version: '2.4.0-expediente-setor',
     timestamp: new Date().toISOString(),
     endpoints: [
       'GET /health',
@@ -246,6 +314,9 @@ app.get('/', (req, res) => {
       'POST /api/lotes',
       'GET /api/lote/:op',
       'PATCH /api/producao/:id',
+      'GET /api/expediente',
+      'GET /api/expediente/:setor',
+      'POST /api/expediente/toggle',
       'GET /api/cq/lotes/:op',
       'GET /api/cq/lote-resumo/:op',
       'POST /api/cq/analises',
@@ -272,7 +343,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.3.0-lote-manual',
+    version: '2.4.0-expediente-setor',
     timestamp: new Date().toISOString(),
     sync: getSyncStats(),
   });
@@ -1156,7 +1227,11 @@ app.get('/api/lote/:op', async (req, res) => {
           prioridade: lote.prioridade,
           status: lote.status,
           setor_atual: lote.setor_atual,
-          origem: lote.origem
+          origem: lote.origem,
+          ff_lotStatus: lote.ff_lotStatus || null,
+          ff_sectorEnteredAt: lote.ff_sectorEnteredAt || null,
+          ff_workSessions: lote.ff_workSessions || null,
+          ff_expedientePausedStatus: lote.ff_expedientePausedStatus || null
         }
       });
     }
@@ -1300,7 +1375,11 @@ app.patch('/api/producao/:id', async (req, res) => {
       'classificado_pcp',
       'liberado_pcp',
       'data_liberacao_pcp',
-      'rota_escolhida'
+      'rota_escolhida',
+      'ff_lotStatus',
+      'ff_sectorEnteredAt',
+      'ff_workSessions',
+      'ff_expedientePausedStatus'
     ];
 
     const body = req.body || {};
@@ -1338,6 +1417,113 @@ app.patch('/api/producao/:id', async (req, res) => {
   } catch (err) {
     console.error('PATCH /api/producao/:id erro:', err.message);
     sendError(res, 500, 'Erro ao atualizar lote', err.message);
+  }
+});
+
+
+// =========================
+// FACTORYFLOW - EXPEDIENTE POR SETOR
+// =========================
+
+app.get('/api/expediente', async (req, res) => {
+  try {
+    await ensureSectorShiftTable();
+
+    const [rows] = await dbPool.query(`
+      SELECT
+        id,
+        setor,
+        expediente_aberto,
+        iniciado_em,
+        finalizado_em,
+        atualizado_em
+      FROM ff_sector_shifts
+      ORDER BY setor ASC
+    `);
+
+    res.json({ ok: true, total: rows.length, data: rows });
+  } catch (err) {
+    console.error('GET /api/expediente erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar expediente dos setores', err.message);
+  }
+});
+
+app.get('/api/expediente/:setor', async (req, res) => {
+  try {
+    await ensureSectorShiftTable();
+
+    const setor = normalizeShiftSetor(req.params.setor);
+    if (!setor) return sendError(res, 400, 'Setor obrigatório');
+
+    const [rows] = await dbPool.query(
+      `SELECT * FROM ff_sector_shifts WHERE setor = ? LIMIT 1`,
+      [setor]
+    );
+
+    if (!rows.length) {
+      await dbPool.query(
+        `INSERT INTO ff_sector_shifts (setor, expediente_aberto) VALUES (?, 0)`,
+        [setor]
+      );
+
+      const [created] = await dbPool.query(
+        `SELECT * FROM ff_sector_shifts WHERE setor = ? LIMIT 1`,
+        [setor]
+      );
+
+      return res.json({ ok: true, data: created[0] });
+    }
+
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('GET /api/expediente/:setor erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar expediente do setor', err.message);
+  }
+});
+
+app.post('/api/expediente/toggle', async (req, res) => {
+  try {
+    await ensureSectorShiftTable();
+
+    const setor = normalizeShiftSetor(req.body?.setor);
+    const aberto = Number(req.body?.expediente_aberto) === 1 || req.body?.expediente_aberto === true;
+
+    if (!setor) return sendError(res, 400, 'Setor obrigatório');
+
+    if (aberto) {
+      await dbPool.query(
+        `
+          INSERT INTO ff_sector_shifts (setor, expediente_aberto, iniciado_em, finalizado_em)
+          VALUES (?, 1, NOW(), NULL)
+          ON DUPLICATE KEY UPDATE
+            expediente_aberto = 1,
+            iniciado_em = NOW(),
+            finalizado_em = NULL
+        `,
+        [setor]
+      );
+    } else {
+      await dbPool.query(
+        `
+          INSERT INTO ff_sector_shifts (setor, expediente_aberto, finalizado_em)
+          VALUES (?, 0, NOW())
+          ON DUPLICATE KEY UPDATE
+            expediente_aberto = 0,
+            finalizado_em = NOW()
+        `,
+        [setor]
+      );
+    }
+
+    const [rows] = await dbPool.query(
+      `SELECT * FROM ff_sector_shifts WHERE setor = ? LIMIT 1`,
+      [setor]
+    );
+
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('POST /api/expediente/toggle erro:', err.message);
+    sendError(res, 500, 'Erro ao alterar expediente do setor', err.message);
   }
 });
 
@@ -1389,6 +1575,10 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
             linha_produto: row.linha_produto,
             tipo_lote: row.tipo_lote,
             origem: row.origem,
+            ff_lotStatus: row.ff_lotStatus || null,
+            ff_sectorEnteredAt: row.ff_sectorEnteredAt || null,
+            ff_workSessions: row.ff_workSessions || null,
+            ff_expedientePausedStatus: row.ff_expedientePausedStatus || null,
           }
         ],
       });
@@ -1479,6 +1669,10 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
           linha_produto: row.linha_produto,
           tipo_lote: row.tipo_lote,
           origem: row.origem,
+          ff_lotStatus: row.ff_lotStatus || null,
+          ff_sectorEnteredAt: row.ff_sectorEnteredAt || null,
+          ff_workSessions: row.ff_workSessions || null,
+          ff_expedientePausedStatus: row.ff_expedientePausedStatus || null,
         }
       });
     }
@@ -2742,6 +2936,7 @@ const FF_TABLES = {
         sector VARCHAR(100) NULL,
         lotStatus VARCHAR(50) NULL,
         workSessions LONGTEXT NULL,
+        expedientePausedStatus VARCHAR(50) NULL,
         sectorEnteredAt BIGINT NULL,
         createdAt BIGINT NULL,
         createdBy VARCHAR(100) NULL,
@@ -2757,7 +2952,7 @@ const FF_TABLES = {
     columns: [
       'id','number','orderId','orderNumber','client','productCode','paint','productType',
       'endurecedorRoute','destinoEndurecedor','qty','unit','priority','deliveryDate','skipColor',
-      'city','address','notes','sector','lotStatus','workSessions','sectorEnteredAt','createdAt',
+      'city','address','notes','sector','lotStatus','workSessions','expedientePausedStatus','sectorEnteredAt','createdAt',
       'createdBy','rejected','rejectedAt','rejectedReason','rejectedBy','rejectedSector','history'
     ]
   },
@@ -3037,11 +3232,13 @@ app.use((req, res) => {
 (async () => {
   try {
     console.log('\n╔════════════════════════════════════════════════════╗');
-    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.3.0 LOTE MANUAL    ║');
+    console.log('║   FactoryFlow + CQVision – MySQL Bridge v2.4.0 EXPEDIENTE    ║');
     console.log('╚════════════════════════════════════════════════════╝\n');
 
     await testConnection();
     await ensureProductionLotesManualColumns();
+    await ensureSectorShiftTable();
+    await ensureProductionLotesTimeColumns();
 
     app.listen(PORT, () => {
       console.log(`🚀 API rodando em http://localhost:${PORT}\n`);
