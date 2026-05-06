@@ -404,6 +404,38 @@ app.get('/api/clientes', async (req, res) => {
   }
 });
 
+
+app.get('/api/clientes/:codigo', async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo || '').trim();
+    if (!codigo) return sendError(res, 400, 'Informe o código do cliente');
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          cli_codigo,
+          cli_nome,
+          cli_endereco,
+          cli_bairro,
+          cli_cidade,
+          cli_cep,
+          cli_estado
+        FROM cli_clientes
+        WHERE TRIM(cli_codigo) = TRIM(?)
+           OR CAST(TRIM(cli_codigo) AS UNSIGNED) = CAST(TRIM(?) AS UNSIGNED)
+        LIMIT 1
+      `,
+      [codigo, codigo]
+    );
+
+    if (!rows.length) return sendError(res, 404, 'Cliente não encontrado');
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('GET /api/clientes/:codigo erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar cliente por código', err.message);
+  }
+});
+
 // =========================
 // MATÉRIAS-PRIMAS
 // =========================
@@ -1007,6 +1039,11 @@ async function criarLoteManual(req, res) {
     const produtoNome = String(body.produto_nome || body.nome_produto || body.pits_nome_produto || '').trim();
     const clienteCodigo = String(body.cliente_codigo || body.codigo_cliente || body.pits_cliente || '').trim();
     const clienteNome = String(body.cliente_nome || body.nome_cliente || body.cliente || '').trim();
+    const clienteEndereco = String(body.cliente_endereco || body.endereco || '').trim();
+    const clienteBairro = String(body.cliente_bairro || body.bairro || '').trim();
+    const clienteCidade = String(body.cliente_cidade || body.cidade || '').trim();
+    const clienteCep = String(body.cliente_cep || body.cep || '').trim();
+    const clienteEstado = String(body.cliente_estado || body.estado || '').trim();
     const tipoLote = String(body.tipo_lote || body.tipo || 'manual').trim();
     const linhaProduto = String(body.linha_produto || body.linha || body.product_type || '').trim();
     const prioridade = String(body.prioridade || body.urgencia || 'normal').trim();
@@ -1042,6 +1079,11 @@ async function criarLoteManual(req, res) {
           quantidade,
           cliente_codigo,
           cliente_nome,
+          cliente_endereco,
+          cliente_bairro,
+          cliente_cidade,
+          cliente_cep,
+          cliente_estado,
           status,
           prioridade,
           classificado_pcp,
@@ -1049,7 +1091,7 @@ async function criarLoteManual(req, res) {
           setor_atual,
           origem,
           linha_produto
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?)
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?)
       `,
       [
         numeroPedido || `MANUAL-${op}`,
@@ -1060,6 +1102,11 @@ async function criarLoteManual(req, res) {
         quantidade,
         clienteCodigo,
         clienteNome,
+        clienteEndereco,
+        clienteBairro,
+        clienteCidade,
+        clienteCep,
+        clienteEstado,
         status,
         prioridade,
         setorAtual,
