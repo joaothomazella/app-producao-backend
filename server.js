@@ -11,6 +11,7 @@ const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
 app.use(express.json({ limit: '2mb' }));
+app.use(express.urlencoded({ extended: false }));
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
   .split(',')
   .map(origin => origin.trim())
@@ -346,6 +347,160 @@ app.get('/health', (req, res) => {
     version: '2.4.0-expediente-setor',
     timestamp: new Date().toISOString(),
     sync: getSyncStats(),
+  });
+});
+
+
+// =========================
+// WHATSAPP / TWILIO WEBHOOK — PÚBLICO
+// =========================
+// Configure na Twilio Sandbox em "When a message comes in":
+// https://SEU-BACKEND.up.railway.app/webhook/whatsapp
+// Método: HTTP POST
+
+function escapeXml(value) {
+  return String(value ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function twimlResponse(message) {
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Message>${escapeXml(message)}</Message>
+</Response>`;
+}
+
+async function consultarPedidoOuOpWhatsapp(texto) {
+  const mensagem = String(texto || '').trim();
+  const numeroEncontrado = mensagem.match(/\b\d{5,8}\b/);
+
+  if (!numeroEncontrado) {
+    return null;
+  }
+
+  const numero = numeroEncontrado[0];
+
+  // 1) Tenta achar como OP/lote em producao_lotes ou cli_pedidos_itens
+  const lote = await getProductionLoteByOp(numero).catch(() => null);
+
+  if (lote) {
+    return [
+      `✅ OP/Lote ${lote.op} encontrado no FactoryFlow.`,
+      `Pedido: ${lote.numero_pedido || '-'}`,
+      `Cliente: ${lote.cliente_nome || '-'}`,
+      `Produto: ${lote.produto_nome || '-'}`,
+      `Setor atual: ${lote.setor_atual || '-'}`,
+      `Status: ${lote.status || '-'}`,
+      `Prioridade: ${lote.prioridade || '-'}`,
+    ].join('\n');
+  }
+
+  const pedidoItem = await getPedidoItemByOp(numero).catch(() => null);
+
+  if (pedidoItem) {
+    return [
+      `✅ OP ${pedidoItem.pits_op} encontrada nos pedidos.`,
+      `Pedido: ${pedidoItem.pits_numero || '-'}`,
+      `Cliente: ${pedidoItem.nome_cliente || '-'}`,
+      `Produto: ${pedidoItem.pits_nome_produto || '-'}`,
+      `Quantidade: ${pedidoItem.pits_qtde || '-'}`,
+      `Previsão: ${pedidoItem.pits_previsao || '-'}`,
+    ].join('\n');
+  }
+
+  // 2) Se não achou como OP, tenta achar como número de pedido
+  const [pedidoRows] = await dbPool.query(
+    `
+      SELECT
+        p.pits_numero,
+        p.pits_op,
+        p.pits_cliente,
+        c.cli_nome AS nome_cliente,
+        p.pits_nome_produto,
+        p.pits_qtde,
+        p.pits_peso,
+        p.pits_previsao
+      FROM cli_pedidos_itens p
+      LEFT JOIN cli_clientes c
+        ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+      WHERE TRIM(p.pits_numero) = TRIM(?)
+      ORDER BY p.id ASC
+      LIMIT 8
+    `,
+    [numero]
+  );
+
+  if (pedidoRows.length) {
+    const cliente = pedidoRows[0].nome_cliente || '-';
+    const previsao = pedidoRows[0].pits_previsao || '-';
+    const ops = pedidoRows
+      .map((row) => `• OP ${row.pits_op || '-'} — ${row.pits_nome_produto || '-'}`)
+      .join('\n');
+
+    return [
+      `✅ Pedido ${numero} encontrado.`,
+      `Cliente: ${cliente}`,
+      `Previsão: ${previsao}`,
+      `Lotes/OPs:`,
+      ops,
+    ].join('\n');
+  }
+
+  return `⚠️ Não encontrei pedido/OP ${numero} no banco do FactoryFlow.`;
+}
+
+app.post('/webhook/whatsapp', async (req, res) => {
+  try {
+    const mensagem = String(req.body.Body || '').trim();
+    const numero = String(req.body.From || '').trim();
+
+    console.log('📩 WhatsApp recebido:', mensagem);
+    console.log('📱 Número:', numero);
+
+    let resposta = '';
+    const msgLower = mensagem.toLowerCase();
+
+    if (!mensagem) {
+      resposta = 'Recebi sua mensagem, mas ela veio vazia.';
+    } else if (['status', 'teste', 'ping'].includes(msgLower)) {
+      resposta = '✅ WhatsApp conectado ao backend FactoryFlow. Pode mandar uma OP ou pedido para consultar.';
+    } else if (msgLower.includes('ajuda') || msgLower.includes('menu')) {
+      resposta = [
+        '🤖 IndusOne IA — FactoryFlow',
+        'Você pode mandar:',
+        '• status',
+        '• pedido 087153',
+        '• op 087153',
+        '• onde está 087153'
+      ].join('\n');
+    } else {
+      resposta = await consultarPedidoOuOpWhatsapp(mensagem);
+      if (!resposta) {
+        resposta = [
+          'Recebi sua mensagem.',
+          'Por enquanto me mande uma OP ou número de pedido para consultar no FactoryFlow.',
+          'Exemplo: onde está 087153'
+        ].join('\n');
+      }
+    }
+
+    res.type('text/xml');
+    return res.status(200).send(twimlResponse(resposta));
+  } catch (err) {
+    console.error('❌ Erro webhook WhatsApp:', err);
+    res.type('text/xml');
+    return res.status(200).send(twimlResponse('❌ Erro interno ao consultar o FactoryFlow.'));
+  }
+});
+
+app.get('/webhook/whatsapp', (req, res) => {
+  res.json({
+    ok: true,
+    message: 'Webhook WhatsApp FactoryFlow ativo. Configure a Twilio para enviar POST para esta URL.',
   });
 });
 
