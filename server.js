@@ -10,6 +10,14 @@ const { startSync, getSyncStats, runSync } = require('./sync');
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
 
+// ─────────────────────────────────────
+// OPENAI / IA
+// ─────────────────────────────────────
+// Configure no Railway em Variables:
+// OPENAI_API_KEY=sua-chave-da-openai
+const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
+const OPENAI_MODEL = (process.env.OPENAI_MODEL || 'gpt-4.1-mini').trim();
+
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
 const allowedOrigins = (process.env.CORS_ORIGIN || '')
@@ -352,11 +360,16 @@ app.get('/health', (req, res) => {
 
 
 // =========================
-// WHATSAPP / TWILIO WEBHOOK — PÚBLICO
+// WHATSAPP / TWILIO WEBHOOK — PÚBLICO + OPENAI
 // =========================
 // Configure na Twilio Sandbox em "When a message comes in":
 // https://SEU-BACKEND.up.railway.app/webhook/whatsapp
 // Método: HTTP POST
+//
+// Para ativar a IA:
+// 1) Railway > Variables
+// 2) Adicione OPENAI_API_KEY
+// 3) Faça deploy novamente
 
 function escapeXml(value) {
   return String(value ?? '')
@@ -372,6 +385,111 @@ function twimlResponse(message) {
 <Response>
   <Message>${escapeXml(message)}</Message>
 </Response>`;
+}
+
+function limparTexto(value) {
+  return String(value || '')
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .trim();
+}
+
+function formatarDataCurta(value) {
+  if (!value) return '-';
+
+  try {
+    const d = new Date(value);
+    if (Number.isNaN(d.getTime())) return String(value);
+
+    return d.toLocaleDateString('pt-BR', {
+      timeZone: 'America/Sao_Paulo'
+    });
+  } catch (_) {
+    return String(value);
+  }
+}
+
+function normalizarSetorPergunta(texto) {
+  const t = limparTexto(texto);
+
+  if (t.includes('laboratorio') || t.includes('lab')) return 'laboratorio';
+  if (t.includes('coloracao') || t.includes('cor')) return 'coloracao';
+  if (t.includes('envase') || t.includes('enlatamento')) return 'envase';
+  if (t.includes('producao') || t.includes('moagem')) return 'producao';
+  if (t.includes('pesagem')) return 'pesagem';
+  if (t.includes('expedicao') || t.includes('entrega') || t.includes('pronto')) return 'expedicao';
+  if (t.includes('pcp')) return 'pcp';
+
+  return '';
+}
+
+async function chamarOpenAIParaInterpretar(mensagem) {
+  if (!OPENAI_API_KEY) {
+    return null;
+  }
+
+  try {
+    const promptSistema = `
+Você é o interpretador da IA operacional da Induscolor.
+Transforme a pergunta do WhatsApp em JSON puro, sem markdown.
+
+Intenções possíveis:
+- consultar_numero: quando tiver OP, lote ou pedido numérico.
+- listar_setor: quando perguntar quais lotes estão em um setor.
+- buscar_cliente: quando perguntar por cliente.
+- resumo_operacional: quando perguntar visão geral, atrasos, urgentes ou situação geral.
+- ajuda: quando pedir ajuda/menu.
+- desconhecido: quando não entender.
+
+Campos esperados:
+{
+  "intent": "consultar_numero|listar_setor|buscar_cliente|resumo_operacional|ajuda|desconhecido",
+  "numero": "string ou vazio",
+  "setor": "laboratorio|coloracao|envase|producao|pesagem|expedicao|pcp|vazio",
+  "cliente": "string ou vazio",
+  "resumo": "frase curta explicando o que o usuário quer"
+}
+
+Regras:
+- Se houver número de 5 a 8 dígitos, coloque em numero.
+- "lab" significa laboratorio.
+- "cor" pode significar coloracao.
+- "pronto para entrega" ou "entrega" pode significar expedicao.
+- Retorne somente JSON válido.
+`;
+
+    const response = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${OPENAI_API_KEY}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: OPENAI_MODEL,
+        temperature: 0,
+        messages: [
+          { role: 'system', content: promptSistema },
+          { role: 'user', content: mensagem }
+        ]
+      })
+    });
+
+    if (!response.ok) {
+      const text = await response.text().catch(() => '');
+      console.error('❌ OpenAI erro:', response.status, text);
+      return null;
+    }
+
+    const data = await response.json();
+    const raw = data?.choices?.[0]?.message?.content || '';
+    const cleaned = raw.replace(/```json|```/g, '').trim();
+
+    return JSON.parse(cleaned);
+  } catch (err) {
+    console.error('❌ Erro ao interpretar com OpenAI:', err.message);
+    return null;
+  }
 }
 
 async function consultarPedidoOuOpWhatsapp(texto) {
@@ -408,7 +526,7 @@ async function consultarPedidoOuOpWhatsapp(texto) {
       `Cliente: ${pedidoItem.nome_cliente || '-'}`,
       `Produto: ${pedidoItem.pits_nome_produto || '-'}`,
       `Quantidade: ${pedidoItem.pits_qtde || '-'}`,
-      `Previsão: ${pedidoItem.pits_previsao || '-'}`,
+      `Previsão: ${formatarDataCurta(pedidoItem.pits_previsao)}`,
     ].join('\n');
   }
 
@@ -429,28 +547,243 @@ async function consultarPedidoOuOpWhatsapp(texto) {
         ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
       WHERE TRIM(p.pits_numero) = TRIM(?)
       ORDER BY p.id ASC
-      LIMIT 8
+      LIMIT 12
     `,
     [numero]
   );
 
   if (pedidoRows.length) {
     const cliente = pedidoRows[0].nome_cliente || '-';
-    const previsao = pedidoRows[0].pits_previsao || '-';
-    const ops = pedidoRows
-      .map((row) => `• OP ${row.pits_op || '-'} — ${row.pits_nome_produto || '-'}`)
-      .join('\n');
+    const previsao = formatarDataCurta(pedidoRows[0].pits_previsao);
+    const opsUnicas = new Map();
+
+    for (const row of pedidoRows) {
+      const op = String(row.pits_op || '-').trim();
+      const produto = String(row.pits_nome_produto || '-').trim();
+      const chave = `${op}_${produto}`;
+      if (!opsUnicas.has(chave)) {
+        opsUnicas.set(chave, `• OP ${op} — ${produto}`);
+      }
+    }
 
     return [
       `✅ Pedido ${numero} encontrado.`,
       `Cliente: ${cliente}`,
       `Previsão: ${previsao}`,
       `Lotes/OPs:`,
-      ops,
+      [...opsUnicas.values()].join('\n'),
     ].join('\n');
   }
 
   return `⚠️ Não encontrei pedido/OP ${numero} no banco do FactoryFlow.`;
+}
+
+async function consultarLotesPorSetorWhatsapp(setorBruto) {
+  const setor = normalizarSetorPergunta(setorBruto || '');
+
+  if (!setor) {
+    return 'Me diga o setor que você quer consultar. Exemplo: quais lotes estão no laboratório?';
+  }
+
+  const hasProducaoLotes = await tableExists('producao_lotes');
+  if (!hasProducaoLotes) {
+    return '⚠️ A tabela producao_lotes não foi encontrada no banco.';
+  }
+
+  const busca = `%${setor}%`;
+
+  const [rows] = await dbPool.query(
+    `
+      SELECT
+        op,
+        numero_pedido,
+        cliente_nome,
+        produto_nome,
+        quantidade,
+        setor_atual,
+        status,
+        prioridade,
+        updated_at,
+        data_criacao
+      FROM producao_lotes
+      WHERE LOWER(COALESCE(setor_atual, '')) LIKE LOWER(?)
+        AND LOWER(COALESCE(status, '')) NOT IN ('finalizado', 'cancelado')
+      ORDER BY
+        CASE
+          WHEN LOWER(COALESCE(prioridade, '')) LIKE '%urgent%' THEN 0
+          WHEN LOWER(COALESCE(prioridade, '')) LIKE '%alta%' THEN 1
+          ELSE 2
+        END,
+        updated_at DESC,
+        data_criacao DESC
+      LIMIT 10
+    `,
+    [busca]
+  );
+
+  if (!rows.length) {
+    return `✅ Não encontrei lotes ativos no setor ${setor}.`;
+  }
+
+  const linhas = rows.map((row) => {
+    return `• OP ${row.op || '-'} — ${row.cliente_nome || '-'} — ${row.produto_nome || '-'} — ${row.status || '-'}`;
+  });
+
+  return [
+    `📍 Lotes ativos no setor ${setor}:`,
+    ...linhas,
+    '',
+    `Total exibido: ${rows.length}`
+  ].join('\n');
+}
+
+async function consultarClienteWhatsapp(clienteBruto) {
+  const cliente = String(clienteBruto || '').trim();
+
+  if (!cliente || cliente.length < 3) {
+    return 'Me diga o nome do cliente. Exemplo: cliente Carbofibras';
+  }
+
+  const like = `%${cliente}%`;
+
+  const [lotes] = await dbPool.query(
+    `
+      SELECT
+        op,
+        numero_pedido,
+        cliente_nome,
+        produto_nome,
+        setor_atual,
+        status,
+        prioridade,
+        updated_at
+      FROM producao_lotes
+      WHERE cliente_nome LIKE ?
+      ORDER BY updated_at DESC, data_criacao DESC
+      LIMIT 8
+    `,
+    [like]
+  );
+
+  if (lotes.length) {
+    const linhas = lotes.map((row) => {
+      return `• Pedido ${row.numero_pedido || '-'} / OP ${row.op || '-'} — ${row.produto_nome || '-'} — ${row.setor_atual || '-'} — ${row.status || '-'}`;
+    });
+
+    return [
+      `✅ Encontrei lotes para cliente parecido com "${cliente}":`,
+      ...linhas
+    ].join('\n');
+  }
+
+  const [pedidos] = await dbPool.query(
+    `
+      SELECT
+        p.pits_numero,
+        p.pits_op,
+        c.cli_nome AS nome_cliente,
+        p.pits_nome_produto,
+        p.pits_previsao
+      FROM cli_pedidos_itens p
+      LEFT JOIN cli_clientes c
+        ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+      WHERE c.cli_nome LIKE ?
+      ORDER BY p.id DESC
+      LIMIT 8
+    `,
+    [like]
+  );
+
+  if (!pedidos.length) {
+    return `⚠️ Não encontrei cliente parecido com "${cliente}".`;
+  }
+
+  const linhas = pedidos.map((row) => {
+    return `• Pedido ${row.pits_numero || '-'} / OP ${row.pits_op || '-'} — ${row.pits_nome_produto || '-'} — previsão ${formatarDataCurta(row.pits_previsao)}`;
+  });
+
+  return [
+    `✅ Encontrei pedidos para cliente parecido com "${cliente}":`,
+    ...linhas
+  ].join('\n');
+}
+
+async function resumoOperacionalWhatsapp() {
+  const hasProducaoLotes = await tableExists('producao_lotes');
+  if (!hasProducaoLotes) {
+    return '⚠️ A tabela producao_lotes não foi encontrada no banco.';
+  }
+
+  const [porSetor] = await dbPool.query(
+    `
+      SELECT
+        COALESCE(NULLIF(TRIM(setor_atual), ''), 'sem_setor') AS setor,
+        COUNT(*) AS total
+      FROM producao_lotes
+      WHERE LOWER(COALESCE(status, '')) NOT IN ('finalizado', 'cancelado')
+      GROUP BY COALESCE(NULLIF(TRIM(setor_atual), ''), 'sem_setor')
+      ORDER BY total DESC
+      LIMIT 8
+    `
+  );
+
+  if (!porSetor.length) {
+    return '✅ Não encontrei lotes ativos no momento.';
+  }
+
+  const linhas = porSetor.map((row) => `• ${row.setor}: ${row.total}`);
+
+  return [
+    '📊 Resumo operacional FactoryFlow:',
+    ...linhas
+  ].join('\n');
+}
+
+async function responderComOpenAISePrecisar(mensagem) {
+  const interpretacao = await chamarOpenAIParaInterpretar(mensagem);
+
+  if (!interpretacao) {
+    const setorLocal = normalizarSetorPergunta(mensagem);
+    if (setorLocal && (limparTexto(mensagem).includes('quais') || limparTexto(mensagem).includes('lotes') || limparTexto(mensagem).includes('estao'))) {
+      return consultarLotesPorSetorWhatsapp(setorLocal);
+    }
+    return null;
+  }
+
+  const intent = String(interpretacao.intent || '').trim();
+  const numero = String(interpretacao.numero || '').trim();
+  const setor = String(interpretacao.setor || '').trim();
+  const cliente = String(interpretacao.cliente || '').trim();
+
+  if (intent === 'consultar_numero' && numero) {
+    return consultarPedidoOuOpWhatsapp(numero);
+  }
+
+  if (intent === 'listar_setor') {
+    return consultarLotesPorSetorWhatsapp(setor || mensagem);
+  }
+
+  if (intent === 'buscar_cliente') {
+    return consultarClienteWhatsapp(cliente || mensagem);
+  }
+
+  if (intent === 'resumo_operacional') {
+    return resumoOperacionalWhatsapp();
+  }
+
+  if (intent === 'ajuda') {
+    return [
+      '🤖 IndusOne IA — FactoryFlow',
+      'Você pode perguntar:',
+      '• status',
+      '• onde está o pedido 087153?',
+      '• quais lotes estão no laboratório?',
+      '• cliente Carbofibras',
+      '• resumo operacional'
+    ].join('\n');
+  }
+
+  return null;
 }
 
 app.post('/webhook/whatsapp', async (req, res) => {
@@ -462,28 +795,44 @@ app.post('/webhook/whatsapp', async (req, res) => {
     console.log('📱 Número:', numero);
 
     let resposta = '';
-    const msgLower = mensagem.toLowerCase();
+    const msgLower = limparTexto(mensagem);
 
     if (!mensagem) {
       resposta = 'Recebi sua mensagem, mas ela veio vazia.';
     } else if (['status', 'teste', 'ping'].includes(msgLower)) {
-      resposta = '✅ WhatsApp conectado ao backend FactoryFlow. Pode mandar uma OP ou pedido para consultar.';
+      resposta = '✅ WhatsApp conectado ao backend FactoryFlow + IA. Pode mandar uma OP, pedido, cliente ou setor para consultar.';
     } else if (msgLower.includes('ajuda') || msgLower.includes('menu')) {
       resposta = [
         '🤖 IndusOne IA — FactoryFlow',
-        'Você pode mandar:',
+        'Você pode perguntar:',
         '• status',
-        '• pedido 087153',
-        '• op 087153',
-        '• onde está 087153'
+        '• onde está o pedido 087153?',
+        '• quais lotes estão no laboratório?',
+        '• cliente Carbofibras',
+        '• resumo operacional'
       ].join('\n');
     } else {
+      // 1) Se tiver número, consulta direto no banco.
       resposta = await consultarPedidoOuOpWhatsapp(mensagem);
+
+      // 2) Se não tiver número, usa OpenAI para interpretar e consultar o banco.
+      if (!resposta) {
+        resposta = await responderComOpenAISePrecisar(mensagem);
+      }
+
+      // 3) Fallback.
       if (!resposta) {
         resposta = [
           'Recebi sua mensagem.',
-          'Por enquanto me mande uma OP ou número de pedido para consultar no FactoryFlow.',
-          'Exemplo: onde está 087153'
+          OPENAI_API_KEY
+            ? 'Não consegui entender qual consulta fazer ainda.'
+            : 'A IA ainda não está ativada. Configure OPENAI_API_KEY no Railway para entender perguntas naturais.',
+          '',
+          'Exemplos:',
+          '• onde está 087153',
+          '• quais lotes estão no laboratório?',
+          '• cliente Carbofibras',
+          '• resumo operacional'
         ].join('\n');
       }
     }
@@ -500,9 +849,12 @@ app.post('/webhook/whatsapp', async (req, res) => {
 app.get('/webhook/whatsapp', (req, res) => {
   res.json({
     ok: true,
-    message: 'Webhook WhatsApp FactoryFlow ativo. Configure a Twilio para enviar POST para esta URL.',
+    message: 'Webhook WhatsApp FactoryFlow + IA ativo. Configure a Twilio para enviar POST para esta URL.',
+    openai_configurada: !!OPENAI_API_KEY,
+    model: OPENAI_MODEL,
   });
 });
+
 
 // A partir daqui, toda rota /api exige token.
 app.use('/api', requireApiToken);
