@@ -2,6 +2,7 @@
 
 require('dotenv').config();
 
+const crypto = require('crypto');
 const express = require('express');
 const cors = require('cors');
 const { testConnection, dbPool } = require('./db');
@@ -253,47 +254,143 @@ async function getPedidoItemByOp(op) {
 }
 
 // =========================
-// SEGURANÇA - TOKEN/API KEY
+// SEGURANÇA - JWT DOS 3 APPS + TOKEN FIXO
 // =========================
-// Configure no Railway em Variables:
-// FACTORYFLOW_API_TOKEN=uma-chave-grande-e-secreta
+// Este backend aceita dois formatos de autenticação nas rotas /api:
 //
-// O frontend deve enviar em todas as chamadas /api:
-// Authorization: Bearer sua-chave
-// ou:
-// X-API-Key: sua-chave
+// 1) JWT do login central dos apps, enviado como:
+//    Authorization: Bearer <ff_token>
 //
-// /health fica público para monitoramento. Todas as rotas /api ficam protegidas.
+// 2) Token fixo interno/automação, enviado como:
+//    X-API-Key: <FACTORYFLOW_API_TOKEN>
+//    ou Authorization: Bearer <FACTORYFLOW_API_TOKEN>
+//
+// IMPORTANTE:
+// - O JWT_SECRET precisa ser o MESMO no PaintLab, CQVision e FactoryFlow.
+// - /health, / e /webhook/whatsapp continuam públicos.
+// - As rotas /api continuam protegidas.
 
 const API_TOKEN = (process.env.FACTORYFLOW_API_TOKEN || process.env.API_TOKEN || '').trim();
 
-function extractToken(req) {
+const JWT_SECRET = (
+  process.env.JWT_SECRET ||
+  process.env.FACTORYFLOW_JWT_SECRET ||
+  'INDUSCOLORSECURE9xA82kLmP2026'
+).trim();
+
+function base64UrlDecode(value) {
+  const normalized = String(value || '')
+    .replace(/-/g, '+')
+    .replace(/_/g, '/');
+
+  const padded = normalized.padEnd(
+    normalized.length + ((4 - (normalized.length % 4)) % 4),
+    '='
+  );
+
+  return Buffer.from(padded, 'base64').toString('utf8');
+}
+
+function base64UrlEncode(buffer) {
+  return Buffer.from(buffer)
+    .toString('base64')
+    .replace(/=/g, '')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_');
+}
+
+function safeEqual(a, b) {
+  const aBuffer = Buffer.from(String(a || ''));
+  const bBuffer = Buffer.from(String(b || ''));
+
+  if (aBuffer.length !== bBuffer.length) return false;
+
+  return crypto.timingSafeEqual(aBuffer, bBuffer);
+}
+
+function verifyJwtHs256(token) {
+  const parts = String(token || '').split('.');
+
+  if (parts.length !== 3) {
+    throw new Error('JWT malformado');
+  }
+
+  const [headerEncoded, payloadEncoded, signature] = parts;
+  const header = JSON.parse(base64UrlDecode(headerEncoded));
+
+  if (header.alg !== 'HS256') {
+    throw new Error(`Algoritmo JWT não suportado: ${header.alg || 'vazio'}`);
+  }
+
+  const expectedSignature = base64UrlEncode(
+    crypto
+      .createHmac('sha256', JWT_SECRET)
+      .update(`${headerEncoded}.${payloadEncoded}`)
+      .digest()
+  );
+
+  if (!safeEqual(signature, expectedSignature)) {
+    throw new Error('Assinatura JWT inválida');
+  }
+
+  const payload = JSON.parse(base64UrlDecode(payloadEncoded));
+  const now = Math.floor(Date.now() / 1000);
+
+  if (payload.exp && Number(payload.exp) < now) {
+    throw new Error('JWT expirado');
+  }
+
+  if (payload.nbf && Number(payload.nbf) > now) {
+    throw new Error('JWT ainda não válido');
+  }
+
+  return payload;
+}
+
+function extractAuthToken(req) {
   const auth = String(req.headers.authorization || '').trim();
 
   if (auth.toLowerCase().startsWith('bearer ')) {
     return auth.slice(7).trim();
   }
 
+  return '';
+}
+
+function extractApiKey(req) {
   return String(req.headers['x-api-key'] || '').trim();
 }
 
 function requireApiToken(req, res, next) {
-  if (!API_TOKEN) {
-    return sendError(
-      res,
-      503,
-      'API sem token configurado no servidor',
-      'Configure FACTORYFLOW_API_TOKEN nas variáveis de ambiente do Railway.'
-    );
+  const bearerToken = extractAuthToken(req);
+  const apiKey = extractApiKey(req);
+
+  // 1) Libera automações/comandos internos com token fixo.
+  if (API_TOKEN && (safeEqual(apiKey, API_TOKEN) || safeEqual(bearerToken, API_TOKEN))) {
+    req.authType = 'api_token';
+    return next();
   }
 
-  const receivedToken = extractToken(req);
+  // 2) Libera usuários logados nos apps pelo JWT central.
+  if (bearerToken) {
+    try {
+      const decoded = verifyJwtHs256(bearerToken);
 
-  if (!receivedToken || receivedToken !== API_TOKEN) {
-    return sendError(res, 401, 'Acesso não autorizado', 'Token ausente ou inválido.');
+      req.user = decoded;
+      req.authType = 'jwt';
+
+      return next();
+    } catch (err) {
+      console.warn('⚠️ JWT recusado pelo FactoryFlow:', err.message);
+    }
   }
 
-  return next();
+  return sendError(
+    res,
+    401,
+    'Acesso não autorizado',
+    'Token ausente ou inválido.'
+  );
 }
 
 // =========================
