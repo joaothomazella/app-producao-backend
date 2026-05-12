@@ -1917,23 +1917,162 @@ app.get('/api/producao', async (req, res) => {
       params
     );
 
+    // IMPORTANTE:
+    // A tela do FactoryFlow usa /api/producao para montar os pedidos.
+    // Antes esta rota retornava apenas producao_lotes, e essa tabela não tem pits_previsao.
+    // Por isso o front recebia deliveryDate vazio.
+    //
+    // Aqui enriquecemos cada lote com a previsão vinda de cli_pedidos_itens.
+    // Primeiro tentamos pelo OP, que é o vínculo mais forte.
+    // Depois tentamos pelo número do pedido, para cobrir lote manual ou OP divergente.
     const [rows] = await dbPool.query(
       `
-        SELECT *
-        FROM producao_lotes
-        ${where}
-        ORDER BY data_criacao DESC, id DESC
+        SELECT
+          pl.*,
+
+          COALESCE(
+            pi_op.pits_previsao,
+            pi_pedido.pits_previsao
+          ) AS pits_previsao,
+
+          COALESCE(
+            pi_op.pits_previsao,
+            pi_pedido.pits_previsao
+          ) AS previsao_entrega,
+
+          COALESCE(
+            pi_op.pits_numero,
+            pi_pedido.pits_numero,
+            pl.numero_pedido
+          ) AS pedido_origem,
+
+          COALESCE(
+            pi_op.pits_cliente,
+            pi_pedido.pits_cliente,
+            pl.cliente_codigo
+          ) AS pits_cliente,
+
+          COALESCE(
+            pi_op.pits_produto,
+            pi_pedido.pits_produto,
+            pl.produto_codigo
+          ) AS pits_produto,
+
+          COALESCE(
+            pi_op.pits_nome_produto,
+            pi_pedido.pits_nome_produto,
+            pl.produto_nome
+          ) AS pits_nome_produto,
+
+          COALESCE(
+            pi_op.pits_qtde,
+            pi_pedido.pits_qtde,
+            pl.quantidade
+          ) AS pits_qtde,
+
+          COALESCE(
+            c_op.cli_nome,
+            c_pedido.cli_nome,
+            pl.cliente_nome
+          ) AS nome_cliente_pedido,
+
+          COALESCE(
+            c_op.cli_endereco,
+            c_pedido.cli_endereco,
+            pl.cliente_endereco
+          ) AS cli_endereco,
+
+          COALESCE(
+            c_op.cli_bairro,
+            c_pedido.cli_bairro,
+            pl.cliente_bairro
+          ) AS cli_bairro,
+
+          COALESCE(
+            c_op.cli_cidade,
+            c_pedido.cli_cidade,
+            pl.cliente_cidade
+          ) AS cli_cidade,
+
+          COALESCE(
+            c_op.cli_cep,
+            c_pedido.cli_cep,
+            pl.cliente_cep
+          ) AS cli_cep,
+
+          COALESCE(
+            c_op.cli_estado,
+            c_pedido.cli_estado,
+            pl.cliente_estado
+          ) AS cli_estado
+
+        FROM producao_lotes pl
+
+        LEFT JOIN cli_pedidos_itens pi_op
+          ON TRIM(pi_op.pits_op) = TRIM(pl.op)
+
+        LEFT JOIN cli_clientes c_op
+          ON CAST(TRIM(c_op.cli_codigo) AS UNSIGNED) = CAST(TRIM(pi_op.pits_cliente) AS UNSIGNED)
+
+        LEFT JOIN (
+          SELECT
+            pits_numero,
+            MIN(pits_previsao) AS pits_previsao,
+            MIN(pits_cliente) AS pits_cliente,
+            MIN(pits_produto) AS pits_produto,
+            MAX(pits_nome_produto) AS pits_nome_produto,
+            SUM(COALESCE(pits_qtde, 0)) AS pits_qtde
+          FROM cli_pedidos_itens
+          WHERE pits_numero IS NOT NULL
+            AND pits_numero <> ''
+          GROUP BY pits_numero
+        ) pi_pedido
+          ON TRIM(pi_pedido.pits_numero) = TRIM(pl.numero_pedido)
+
+        LEFT JOIN cli_clientes c_pedido
+          ON CAST(TRIM(c_pedido.cli_codigo) AS UNSIGNED) = CAST(TRIM(pi_pedido.pits_cliente) AS UNSIGNED)
+
+        ${where.replace(/\bstatus\b/g, 'pl.status')
+               .replace(/\bsetor_atual\b/g, 'pl.setor_atual')
+               .replace(/\bcliente_nome\b/g, 'pl.cliente_nome')
+               .replace(/\bproduto_nome\b/g, 'pl.produto_nome')
+               .replace(/\bnumero_pedido\b/g, 'pl.numero_pedido')
+               .replace(/\bop\b/g, 'pl.op')}
+
+        GROUP BY pl.id
+        ORDER BY pl.data_criacao DESC, pl.id DESC
         LIMIT ? OFFSET ?
       `,
       [...params, limit, offset]
     );
+
+    const data = rows.map((row) => ({
+      ...row,
+
+      // Compatibilidade com o front:
+      // data.js procura estes nomes.
+      deliveryDate: row.pits_previsao || row.previsao_entrega || null,
+      delivery_date: row.pits_previsao || row.previsao_entrega || null,
+      data_entrega: row.pits_previsao || row.previsao_entrega || null,
+
+      // Se o pedido real trouxe dados melhores que o lote manual, já devolve enriquecido.
+      cliente_nome: row.nome_cliente_pedido || row.cliente_nome,
+      cliente_endereco: row.cli_endereco || row.cliente_endereco,
+      cliente_bairro: row.cli_bairro || row.cliente_bairro,
+      cliente_cidade: row.cli_cidade || row.cliente_cidade,
+      cliente_cep: row.cli_cep || row.cliente_cep,
+      cliente_estado: row.cli_estado || row.cliente_estado,
+      produto_nome: row.pits_nome_produto || row.produto_nome,
+      produto_codigo: row.pits_produto || row.produto_codigo,
+      quantidade: row.pits_qtde || row.quantidade,
+    }));
 
     res.json({
       ok: true,
       total: Number(total),
       limit,
       offset,
-      data: rows,
+      data,
     });
   } catch (err) {
     console.error('GET /api/producao erro:', err.message);
