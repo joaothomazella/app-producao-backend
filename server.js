@@ -439,6 +439,9 @@ app.get('/', (req, res) => {
       'GET /api/cq/dashboard/produtos-criticos',
       'GET /api/cq/produtos',
       'GET /api/cq/produtos/:codigo/previsao',
+      'GET /api/cq/previsoes/ops',
+      'GET /api/cq/previsoes/produto/:codigo',
+      'GET /api/cq/previsoes/op/:op',
       'GET /api/sync/status',
       'POST /api/sync/run'
     ],
@@ -2270,6 +2273,494 @@ app.post('/api/expediente/toggle', async (req, res) => {
   }
 });
 
+
+// =========================
+// CQ VISION - PREVISÕES AUTOMÁTICAS (FactoryFlow + Histórico CQ)
+// =========================
+
+function cqPrevisaoParseNumber(value) {
+  if (value === null || value === undefined) return null;
+
+  const cleaned = String(value)
+    .replace(',', '.')
+    .replace(/[^\d.-]/g, '')
+    .trim();
+
+  if (!cleaned) return null;
+
+  const n = Number(cleaned);
+  return Number.isFinite(n) ? n : null;
+}
+
+function cqPrevisaoFormatDiff(value, suffix = '') {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return null;
+
+  const n = Number(value);
+  const sign = n > 0 ? '+' : '';
+  const fixed = Math.abs(n) < 1 ? n.toFixed(3) : n.toFixed(1);
+  return `${sign}${fixed.replace('.', ',')}${suffix}`;
+}
+
+function cqPrevisaoTipoPorResultado(resultado) {
+  const r = String(resultado || '').toLowerCase();
+  if (r.includes('reprov')) return 'danger';
+  if (r.includes('reajuste')) return 'warning';
+  if (r.includes('aprov')) return 'success';
+  return 'info';
+}
+
+function cqPrevisaoBuildSugestoes({ padroes, historico, reajustes }) {
+  const sugestoes = [];
+
+  if (!historico || !historico.length) {
+    return [
+      {
+        tipo: 'info',
+        titulo: 'Nenhuma análise encontrada',
+        mensagem: 'Nenhuma análise foi encontrada. Esse será o primeiro lançamento no CQVision. Favor consultar planilha de controle.'
+      }
+    ];
+  }
+
+  const ultimo = historico[0] || {};
+
+  const viscPadrao = cqPrevisaoParseNumber(padroes?.viscosidade_padrao);
+  const densPadrao = cqPrevisaoParseNumber(padroes?.densidade_padrao);
+  const finezaPadrao = cqPrevisaoParseNumber(padroes?.fineza_padrao);
+
+  const viscInicial = cqPrevisaoParseNumber(ultimo.viscosidade_inicial || ultimo.viscosidade_encontrada);
+  const viscFinal = cqPrevisaoParseNumber(ultimo.viscosidade_final || ultimo.viscosidade_encontrada);
+  const densEncontrada = cqPrevisaoParseNumber(ultimo.densidade_encontrada);
+  const finezaEncontrada = cqPrevisaoParseNumber(ultimo.fineza_encontrada);
+
+  if (viscPadrao !== null && viscInicial !== null) {
+    const diffInicial = viscInicial - viscPadrao;
+
+    if (diffInicial > 2) {
+      sugestoes.push({
+        tipo: 'warning',
+        titulo: 'Viscosidade inicial acima do padrão',
+        mensagem: `No último lote, a viscosidade inicial ficou ${cqPrevisaoFormatDiff(diffInicial, ' KU')} acima do padrão. Avaliar tendência de viscosidade alta antes da produção/revisão.`
+      });
+    } else if (diffInicial < -2) {
+      sugestoes.push({
+        tipo: 'warning',
+        titulo: 'Viscosidade inicial abaixo do padrão',
+        mensagem: `No último lote, a viscosidade inicial ficou ${cqPrevisaoFormatDiff(diffInicial, ' KU')} abaixo do padrão. Avaliar corpo/estrutura da tinta antes da liberação.`
+      });
+    } else {
+      sugestoes.push({
+        tipo: 'success',
+        titulo: 'Viscosidade inicial próxima do padrão',
+        mensagem: 'A viscosidade inicial do último lote ficou próxima do padrão informado.'
+      });
+    }
+  }
+
+  if (viscPadrao !== null && viscFinal !== null) {
+    const diffFinal = viscFinal - viscPadrao;
+
+    if (Math.abs(diffFinal) <= 2) {
+      sugestoes.push({
+        tipo: 'success',
+        titulo: 'Viscosidade final ajustada',
+        mensagem: 'A viscosidade final do último lote ficou próxima do padrão após análise/reajuste.'
+      });
+    } else {
+      sugestoes.push({
+        tipo: 'danger',
+        titulo: 'Viscosidade final fora do padrão',
+        mensagem: `Mesmo no resultado final, a viscosidade ficou ${cqPrevisaoFormatDiff(diffFinal, ' KU')} em relação ao padrão. Produto exige atenção especial.`
+      });
+    }
+  }
+
+  if (viscPadrao === null) {
+    sugestoes.push({
+      tipo: 'info',
+      titulo: 'Viscosidade padrão não localizada',
+      mensagem: 'A OP/produto não trouxe viscosidade padrão em cli_pedidos_itens. A comparação foi feita apenas com histórico disponível.'
+    });
+  }
+
+  if (densPadrao !== null && densEncontrada !== null) {
+    const diffDens = densEncontrada - densPadrao;
+
+    if (diffDens < -0.01) {
+      sugestoes.push({
+        tipo: 'warning',
+        titulo: 'Densidade abaixo do padrão',
+        mensagem: `A densidade do último lote ficou ${cqPrevisaoFormatDiff(diffDens)} abaixo do padrão. Atenção ao rendimento e risco de sobra no envase.`
+      });
+    } else if (diffDens > 0.01) {
+      sugestoes.push({
+        tipo: 'warning',
+        titulo: 'Densidade acima do padrão',
+        mensagem: `A densidade do último lote ficou ${cqPrevisaoFormatDiff(diffDens)} acima do padrão. Conferir carga, pigmentação e possíveis correções.`
+      });
+    } else {
+      sugestoes.push({
+        tipo: 'success',
+        titulo: 'Densidade próxima do padrão',
+        mensagem: 'A densidade encontrada no último lote ficou próxima do padrão informado.'
+      });
+    }
+  }
+
+  if (densPadrao === null) {
+    sugestoes.push({
+      tipo: 'info',
+      titulo: 'Densidade padrão não localizada',
+      mensagem: 'A OP/produto não trouxe densidade padrão em cli_pedidos_itens. A comparação foi feita apenas com histórico disponível.'
+    });
+  }
+
+  if (finezaPadrao !== null && finezaEncontrada !== null && finezaEncontrada > finezaPadrao) {
+    sugestoes.push({
+      tipo: 'warning',
+      titulo: 'Fineza acima do padrão',
+      mensagem: `A fineza encontrada ficou acima do padrão. Verificar moagem/dispersão antes de liberar.`
+    });
+  }
+
+  const total = historico.length;
+  const comReajuste = historico.filter((a) => String(a.resultado || '').toLowerCase().includes('reajuste')).length;
+
+  if (total > 0) {
+    const perc = Math.round((comReajuste / total) * 100);
+
+    if (perc >= 50) {
+      sugestoes.push({
+        tipo: 'danger',
+        titulo: 'Produto crítico por frequência de reajuste',
+        mensagem: `${perc}% dos últimos ${total} lançamentos tiveram reajuste. Produto deve ser tratado com atenção especial na revisão.`
+      });
+    } else if (perc > 0) {
+      sugestoes.push({
+        tipo: 'warning',
+        titulo: 'Produto com histórico de reajuste',
+        mensagem: `${perc}% dos últimos ${total} lançamentos tiveram reajuste. Conferir histórico antes da produção.`
+      });
+    }
+  }
+
+  if (reajustes && reajustes.length) {
+    const ultimoReajuste = reajustes[0];
+    sugestoes.push({
+      tipo: 'info',
+      titulo: 'Último reajuste registrado',
+      mensagem: `Motivo: ${ultimoReajuste.motivo_reajuste || '—'}. Matéria-prima: ${ultimoReajuste.materia_prima_nome || '—'}${ultimoReajuste.materia_prima_qtd ? ` (${ultimoReajuste.materia_prima_qtd})` : ''}.`
+    });
+  }
+
+  if (!sugestoes.length) {
+    sugestoes.push({
+      tipo: 'info',
+      titulo: 'Sem alerta relevante',
+      mensagem: 'Há histórico para este produto, mas não foi identificado desvio relevante pelas regras automáticas.'
+    });
+  }
+
+  return sugestoes;
+}
+
+app.get('/api/cq/previsoes/ops', async (req, res) => {
+  try {
+    const setoresQuery = String(req.query.setores || '').trim();
+    const setores = setoresQuery
+      ? setoresQuery.split(',').map(s => s.trim()).filter(Boolean)
+      : ['laboratorio_revisao', 'coloracao', 'coloracao_revisao'];
+
+    const placeholders = setores.map(() => '?').join(',');
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT 
+          pl.id,
+          pl.numero_pedido,
+          pl.op,
+          pl.produto_codigo,
+          pl.produto_nome,
+          pl.tipo_lote,
+          pl.quantidade,
+          pl.cliente_codigo,
+          pl.cliente_nome,
+          pl.setor_atual,
+          pl.status,
+          pl.prioridade,
+          pl.linha_produto,
+          pl.updated_at,
+          pl.data_criacao,
+
+          cpi.pits_viscosidade AS viscosidade_padrao,
+          cpi.pits_densidade AS densidade_padrao,
+          cpi.pits_fineza AS fineza_padrao,
+          cpi.pits_revisao AS revisao,
+          cpi.pits_previsao AS previsao_entrega
+
+        FROM producao_lotes pl
+        LEFT JOIN cli_pedidos_itens cpi 
+          ON TRIM(cpi.pits_op) = TRIM(pl.op)
+
+        WHERE COALESCE(pl.liberado_pcp, 0) = 1
+          AND COALESCE(pl.classificado_pcp, 0) = 1
+          AND LOWER(COALESCE(pl.tipo_lote, '')) = 'tinta'
+          AND pl.setor_atual IN (${placeholders})
+          AND COALESCE(pl.cq_status, 'pendente') = 'pendente'
+
+        GROUP BY pl.id
+        ORDER BY pl.updated_at DESC, pl.id DESC
+        LIMIT 200
+      `,
+      setores
+    );
+
+    res.json({
+      ok: true,
+      total: rows.length,
+      data: rows
+    });
+  } catch (err) {
+    console.error('GET /api/cq/previsoes/ops erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar OPs para previsão', err.message);
+  }
+});
+
+app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo || '').trim();
+    const op = String(req.query.op || '').trim();
+
+    if (!codigo) {
+      return sendError(res, 400, 'Informe o código do produto');
+    }
+
+    let loteAtual = null;
+
+    if (op) {
+      const [loteRows] = await dbPool.query(
+        `
+          SELECT 
+            pl.*,
+            cpi.pits_viscosidade AS viscosidade_padrao,
+            cpi.pits_densidade AS densidade_padrao,
+            cpi.pits_fineza AS fineza_padrao,
+            cpi.pits_revisao AS revisao,
+            cpi.pits_previsao AS previsao_entrega
+          FROM producao_lotes pl
+          LEFT JOIN cli_pedidos_itens cpi 
+            ON TRIM(cpi.pits_op) = TRIM(pl.op)
+          WHERE TRIM(pl.op) = TRIM(?)
+          ORDER BY pl.id DESC
+          LIMIT 1
+        `,
+        [op]
+      );
+
+      loteAtual = loteRows[0] || null;
+    }
+
+    let padroes = {
+      viscosidade_padrao: loteAtual?.viscosidade_padrao || null,
+      densidade_padrao: loteAtual?.densidade_padrao || null,
+      fineza_padrao: loteAtual?.fineza_padrao || null,
+      revisao: loteAtual?.revisao || null,
+      previsao_entrega: loteAtual?.previsao_entrega || null
+    };
+
+    if (!padroes.viscosidade_padrao && !padroes.densidade_padrao) {
+      const [padraoRows] = await dbPool.query(
+        `
+          SELECT
+            pits_viscosidade AS viscosidade_padrao,
+            pits_densidade AS densidade_padrao,
+            pits_fineza AS fineza_padrao,
+            pits_revisao AS revisao,
+            pits_previsao AS previsao_entrega
+          FROM cli_pedidos_itens
+          WHERE TRIM(pits_produto) = TRIM(?)
+          ORDER BY id DESC
+          LIMIT 1
+        `,
+        [codigo]
+      );
+
+      if (padraoRows.length) {
+        padroes = {
+          ...padroes,
+          ...padraoRows[0]
+        };
+      }
+    }
+
+    const [historico] = await dbPool.query(
+      `
+        SELECT
+          id,
+          op,
+          pedido,
+          cliente_nome,
+          produto_codigo,
+          produto_nome,
+          linha_produto,
+          revisao,
+          viscosidade_padrao,
+          densidade_padrao,
+          fineza_padrao,
+          viscosidade_encontrada,
+          densidade_encontrada,
+          fineza_encontrada,
+          solidos_encontrado,
+          resultado,
+          usuario,
+          criado_em,
+          atualizado_em,
+          solidos_a,
+          solidos_ab,
+          viscosidade_inicial,
+          viscosidade_final,
+          data_analise
+        FROM cq_analises
+        WHERE TRIM(produto_codigo) = TRIM(?)
+        ORDER BY criado_em DESC, id DESC
+        LIMIT 5
+      `,
+      [codigo]
+    );
+
+    const analiseIds = historico.map((h) => h.id);
+    let reajustes = [];
+
+    if (analiseIds.length) {
+      const placeholders = analiseIds.map(() => '?').join(',');
+
+      const [reajusteRows] = await dbPool.query(
+        `
+          SELECT
+            r.*,
+            a.op,
+            a.produto_codigo
+          FROM cq_analises_reajustes r
+          JOIN cq_analises a ON a.id = r.analise_id
+          WHERE r.analise_id IN (${placeholders})
+          ORDER BY r.criado_em DESC, r.id DESC
+          LIMIT 20
+        `,
+        analiseIds
+      );
+
+      reajustes = reajusteRows;
+    }
+
+    const ultimo = historico[0] || null;
+    const sugestoes = cqPrevisaoBuildSugestoes({
+      padroes,
+      historico,
+      reajustes
+    });
+
+    const viscPadrao = cqPrevisaoParseNumber(padroes.viscosidade_padrao);
+    const densPadrao = cqPrevisaoParseNumber(padroes.densidade_padrao);
+    const finezaPadrao = cqPrevisaoParseNumber(padroes.fineza_padrao);
+
+    const viscInicial = cqPrevisaoParseNumber(ultimo?.viscosidade_inicial || ultimo?.viscosidade_encontrada);
+    const viscFinal = cqPrevisaoParseNumber(ultimo?.viscosidade_final || ultimo?.viscosidade_encontrada);
+    const densEncontrada = cqPrevisaoParseNumber(ultimo?.densidade_encontrada);
+    const finezaEncontrada = cqPrevisaoParseNumber(ultimo?.fineza_encontrada);
+
+    const totalHistorico = historico.length;
+    const totalReajuste = historico.filter((a) => String(a.resultado || '').toLowerCase().includes('reajuste')).length;
+
+    res.json({
+      ok: true,
+      codigo,
+      op: op || null,
+      temHistorico: totalHistorico > 0,
+      classificacao: totalHistorico === 0
+        ? 'sem_historico'
+        : totalReajuste / totalHistorico >= 0.5
+          ? 'critico'
+          : totalReajuste > 0
+            ? 'atencao'
+            : 'estavel',
+      loteAtual,
+      padroes,
+      ultimo,
+      comparacao: {
+        viscosidade_padrao: viscPadrao,
+        viscosidade_inicial: viscInicial,
+        viscosidade_final: viscFinal,
+        diferenca_viscosidade_inicial: viscPadrao !== null && viscInicial !== null ? viscInicial - viscPadrao : null,
+        diferenca_viscosidade_final: viscPadrao !== null && viscFinal !== null ? viscFinal - viscPadrao : null,
+        densidade_padrao: densPadrao,
+        densidade_encontrada: densEncontrada,
+        diferenca_densidade: densPadrao !== null && densEncontrada !== null ? densEncontrada - densPadrao : null,
+        fineza_padrao: finezaPadrao,
+        fineza_encontrada: finezaEncontrada,
+        diferenca_fineza: finezaPadrao !== null && finezaEncontrada !== null ? finezaEncontrada - finezaPadrao : null
+      },
+      resumo: {
+        total_historico: totalHistorico,
+        total_reajuste: totalReajuste,
+        percentual_reajuste: totalHistorico ? Math.round((totalReajuste / totalHistorico) * 100) : 0,
+        ultimo_resultado_tipo: cqPrevisaoTipoPorResultado(ultimo?.resultado)
+      },
+      historico,
+      reajustes,
+      sugestoes
+    });
+  } catch (err) {
+    console.error('GET /api/cq/previsoes/produto/:codigo erro:', err.message);
+    sendError(res, 500, 'Erro ao gerar previsão do produto', err.message);
+  }
+});
+
+app.get('/api/cq/previsoes/op/:op', async (req, res) => {
+  try {
+    const op = String(req.params.op || '').trim();
+
+    if (!op) {
+      return sendError(res, 400, 'Informe a OP');
+    }
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT 
+          pl.op,
+          pl.produto_codigo,
+          pl.produto_nome,
+          pl.numero_pedido,
+          pl.cliente_nome,
+          cpi.pits_viscosidade AS viscosidade_padrao,
+          cpi.pits_densidade AS densidade_padrao,
+          cpi.pits_fineza AS fineza_padrao,
+          cpi.pits_revisao AS revisao,
+          cpi.pits_previsao AS previsao_entrega
+        FROM producao_lotes pl
+        LEFT JOIN cli_pedidos_itens cpi 
+          ON TRIM(cpi.pits_op) = TRIM(pl.op)
+        WHERE TRIM(pl.op) = TRIM(?)
+        ORDER BY pl.id DESC
+        LIMIT 1
+      `,
+      [op]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 404, 'OP não encontrada para previsão');
+    }
+
+    const row = rows[0];
+    req.params.codigo = row.produto_codigo;
+    req.query.op = row.op;
+
+    return res.redirect(307, `/api/cq/previsoes/produto/${encodeURIComponent(row.produto_codigo)}?op=${encodeURIComponent(row.op)}`);
+  } catch (err) {
+    console.error('GET /api/cq/previsoes/op/:op erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar previsão por OP', err.message);
+  }
+});
+
 // =========================
 // CQ VISION
 // =========================
@@ -4017,6 +4508,9 @@ app.use((req, res) => {
       console.log('   GET  /api/cq/dashboard/produtos-criticos');
       console.log('   GET  /api/cq/produtos');
       console.log('   GET  /api/cq/produtos/:codigo/previsao');
+      console.log('   GET  /api/cq/previsoes/ops');
+      console.log('   GET  /api/cq/previsoes/produto/:codigo');
+      console.log('   GET  /api/cq/previsoes/op/:op');
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
       console.log(API_TOKEN ? '🔐 Segurança: rotas /api protegidas por token.\n' : '⚠️  Segurança: FACTORYFLOW_API_TOKEN não configurado. Rotas /api retornarão 503.\n');
