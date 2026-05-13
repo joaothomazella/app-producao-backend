@@ -2526,18 +2526,22 @@ app.get('/api/cq/previsoes/ops', async (req, res) => {
   }
 });
 
-app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
+app.get('/api/cq/previsoes/produto/:codigoOuOp', async (req, res) => {
   try {
-    const codigo = String(req.params.codigo || '').trim();
-    const op = String(req.query.op || '').trim();
+    const codigoOuOp = String(req.params.codigoOuOp || '').trim();
+    const opQuery = String(req.query.op || '').trim();
 
-    if (!codigo) {
-      return sendError(res, 400, 'Informe o código do produto');
+    if (!codigoOuOp) {
+      return sendError(res, 400, 'Informe o código do produto ou OP');
     }
 
     let loteAtual = null;
+    let codigoProduto = codigoOuOp;
 
-    if (op) {
+    // Se vier uma OP/lote, primeiro resolvemos qual é o produto_codigo.
+    const opParaResolver = opQuery || (/^\d{5,8}$/.test(codigoOuOp) ? codigoOuOp : '');
+
+    if (opParaResolver) {
       const [loteRows] = await dbPool.query(
         `
           SELECT 
@@ -2554,10 +2558,61 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
           ORDER BY pl.id DESC
           LIMIT 1
         `,
-        [op]
+        [opParaResolver]
       );
 
       loteAtual = loteRows[0] || null;
+
+      if (loteAtual?.produto_codigo) {
+        codigoProduto = String(loteAtual.produto_codigo).trim();
+      }
+    }
+
+    // Se o parâmetro ainda parece OP, tenta resolver pela tabela de pedidos.
+    if (/^\d{5,8}$/.test(codigoProduto)) {
+      const [pedidoRows] = await dbPool.query(
+        `
+          SELECT
+            pits_op,
+            pits_numero,
+            pits_cliente,
+            pits_produto,
+            pits_nome_produto,
+            pits_qtde,
+            pits_peso,
+            pits_viscosidade AS viscosidade_padrao,
+            pits_densidade AS densidade_padrao,
+            pits_fineza AS fineza_padrao,
+            pits_revisao AS revisao,
+            pits_previsao AS previsao_entrega
+          FROM cli_pedidos_itens
+          WHERE TRIM(pits_op) = TRIM(?)
+          ORDER BY id DESC
+          LIMIT 1
+        `,
+        [codigoProduto]
+      );
+
+      if (pedidoRows.length && pedidoRows[0].pits_produto) {
+        const pedido = pedidoRows[0];
+        codigoProduto = String(pedido.pits_produto).trim();
+
+        if (!loteAtual) {
+          loteAtual = {
+            op: pedido.pits_op,
+            numero_pedido: pedido.pits_numero,
+            produto_codigo: pedido.pits_produto,
+            produto_nome: pedido.pits_nome_produto,
+            quantidade: pedido.pits_qtde,
+            peso: pedido.pits_peso,
+            viscosidade_padrao: pedido.viscosidade_padrao,
+            densidade_padrao: pedido.densidade_padrao,
+            fineza_padrao: pedido.fineza_padrao,
+            revisao: pedido.revisao,
+            previsao_entrega: pedido.previsao_entrega
+          };
+        }
+      }
     }
 
     let padroes = {
@@ -2568,6 +2623,7 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
       previsao_entrega: loteAtual?.previsao_entrega || null
     };
 
+    // Se o lote atual não trouxe padrões, busca os últimos padrões pelo código do produto.
     if (!padroes.viscosidade_padrao && !padroes.densidade_padrao) {
       const [padraoRows] = await dbPool.query(
         `
@@ -2582,7 +2638,7 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
           ORDER BY id DESC
           LIMIT 1
         `,
-        [codigo]
+        [codigoProduto]
       );
 
       if (padraoRows.length) {
@@ -2593,6 +2649,7 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
       }
     }
 
+    // HISTÓRICO CORRETO: sempre pelo código do produto, não pela OP atual.
     const [historico] = await dbPool.query(
       `
         SELECT
@@ -2625,7 +2682,7 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
         ORDER BY criado_em DESC, id DESC
         LIMIT 5
       `,
-      [codigo]
+      [codigoProduto]
     );
 
     const analiseIds = historico.map((h) => h.id);
@@ -2673,8 +2730,9 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
 
     res.json({
       ok: true,
-      codigo,
-      op: op || null,
+      codigo: codigoProduto,
+      codigoRecebido: codigoOuOp,
+      op: opParaResolver || opQuery || null,
       temHistorico: totalHistorico > 0,
       classificacao: totalHistorico === 0
         ? 'sem_historico'
@@ -2710,10 +2768,11 @@ app.get('/api/cq/previsoes/produto/:codigo', async (req, res) => {
       sugestoes
     });
   } catch (err) {
-    console.error('GET /api/cq/previsoes/produto/:codigo erro:', err.message);
+    console.error('GET /api/cq/previsoes/produto/:codigoOuOp erro:', err.message);
     sendError(res, 500, 'Erro ao gerar previsão do produto', err.message);
   }
 });
+
 
 app.get('/api/cq/previsoes/op/:op', async (req, res) => {
   try {
