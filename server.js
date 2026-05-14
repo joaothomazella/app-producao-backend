@@ -415,6 +415,7 @@ app.get('/', (req, res) => {
       'GET /api/ops',
       'GET /api/ops/:op',
       'GET /api/producao',
+      'GET /api/producao/ativos',
       'GET /api/producao/:id',
       'POST /api/producao/manual',
       'POST /api/lotes',
@@ -1874,6 +1875,144 @@ app.get('/api/lote/:op', async (req, res) => {
   } catch (err) {
     console.error('GET /api/lote/:op erro:', err.message);
     return sendError(res, 500, 'Erro ao buscar lote por OP', err.message);
+  }
+});
+
+
+// =========================
+// PRODUÇÃO - ROTA LEVE PARA ABERTURA DO FACTORYFLOW
+// =========================
+// Esta rota é usada pelo frontend para abrir o app rápido.
+// Ela evita a query pesada de /api/producao, que faz JOINs, GROUP BY e enrich completo.
+// Para detalhes completos de um lote, continue usando GET /api/producao/:id ou /api/lote/:op.
+app.get('/api/producao/ativos', async (req, res) => {
+  try {
+    const hasProducaoLotes = await tableExists('producao_lotes');
+    if (!hasProducaoLotes) {
+      return sendError(
+        res,
+        404,
+        'Tabela producao_lotes não encontrada',
+        'Crie a tabela producao_lotes ou ajuste o nome da tabela no backend.'
+      );
+    }
+
+    const limit = Math.min(toPositiveInt(req.query.limit, 300), 1000);
+    const offset = toPositiveInt(req.query.offset, 0);
+    const status = req.query.status || null;
+    const setor = req.query.setor || null;
+    const search = req.query.search ? `%${req.query.search}%` : null;
+
+    const conditions = [
+      "LOWER(COALESCE(pl.status, '')) NOT IN ('finalizado', 'cancelado', 'rejeitado')"
+    ];
+    const params = [];
+
+    if (status) {
+      conditions.push('pl.status = ?');
+      params.push(status);
+    }
+
+    if (setor) {
+      conditions.push('pl.setor_atual = ?');
+      params.push(setor);
+    }
+
+    if (search) {
+      conditions.push('(pl.cliente_nome LIKE ? OR pl.produto_nome LIKE ? OR pl.numero_pedido LIKE ? OR pl.op LIKE ?)');
+      params.push(search, search, search, search);
+    }
+
+    const where = `WHERE ${conditions.join(' AND ')}`;
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          pl.id,
+          pl.numero_pedido,
+          pl.op,
+          pl.produto_codigo,
+          pl.produto_nome,
+          pl.tipo_lote,
+          pl.quantidade,
+          pl.cliente_codigo,
+          pl.cliente_nome,
+          pl.cliente_endereco,
+          pl.cliente_bairro,
+          pl.cliente_cidade,
+          pl.cliente_cep,
+          pl.cliente_estado,
+          pl.status,
+          pl.prioridade,
+          pl.classificado_pcp,
+          pl.liberado_pcp,
+          pl.setor_atual,
+          pl.data_criacao,
+          pl.updated_at,
+          pl.origem,
+          pl.linha_produto,
+          pl.cq_status,
+          pl.ff_lotStatus,
+          pl.ff_sectorEnteredAt,
+          pl.ff_workSessions,
+          pl.ff_expedientePausedStatus,
+
+          COALESCE(
+            (
+              SELECT p1.pits_previsao
+              FROM cli_pedidos_itens p1
+              WHERE TRIM(p1.pits_op) = TRIM(pl.op)
+              ORDER BY p1.id ASC
+              LIMIT 1
+            ),
+            (
+              SELECT MIN(p2.pits_previsao)
+              FROM cli_pedidos_itens p2
+              WHERE TRIM(p2.pits_numero) = TRIM(pl.numero_pedido)
+            )
+          ) AS pits_previsao,
+
+          COALESCE(
+            (
+              SELECT p1.pits_previsao
+              FROM cli_pedidos_itens p1
+              WHERE TRIM(p1.pits_op) = TRIM(pl.op)
+              ORDER BY p1.id ASC
+              LIMIT 1
+            ),
+            (
+              SELECT MIN(p2.pits_previsao)
+              FROM cli_pedidos_itens p2
+              WHERE TRIM(p2.pits_numero) = TRIM(pl.numero_pedido)
+            )
+          ) AS previsao_entrega
+
+        FROM producao_lotes pl
+        ${where}
+        ORDER BY pl.updated_at DESC, pl.data_criacao DESC, pl.id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    const data = rows.map((row) => ({
+      ...row,
+      deliveryDate: row.pits_previsao || row.previsao_entrega || null,
+      delivery_date: row.pits_previsao || row.previsao_entrega || null,
+      data_entrega: row.pits_previsao || row.previsao_entrega || null,
+    }));
+
+    return res.json({
+      ok: true,
+      total: data.length,
+      limit,
+      offset,
+      mode: 'fast',
+      data,
+    });
+  } catch (err) {
+    console.error('GET /api/producao/ativos erro:', err.message);
+    return sendError(res, 500, 'Erro ao buscar lotes ativos de produção', err.message);
   }
 });
 
