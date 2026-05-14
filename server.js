@@ -144,6 +144,10 @@ async function ensureProductionLotesTimeColumns() {
     {
       name: 'ff_expedientePausedStatus',
       sql: `ALTER TABLE producao_lotes ADD COLUMN ff_expedientePausedStatus VARCHAR(50) NULL`
+    },
+    {
+      name: 'ff_history',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_history LONGTEXT NULL`
     }
   ];
 
@@ -180,6 +184,7 @@ async function getProductionLoteByOp(op) {
   const hasFfSectorEnteredAt = await columnExists('producao_lotes', 'ff_sectorEnteredAt');
   const hasFfWorkSessions = await columnExists('producao_lotes', 'ff_workSessions');
   const hasFfExpedientePausedStatus = await columnExists('producao_lotes', 'ff_expedientePausedStatus');
+  const hasFfHistory = await columnExists('producao_lotes', 'ff_history');
 
   const [rows] = await dbPool.query(
     `
