@@ -209,6 +209,7 @@ async function getProductionLoteByOp(op) {
         ${hasFfSectorEnteredAt ? 'ff_sectorEnteredAt' : 'NULL AS ff_sectorEnteredAt'},
         ${hasFfWorkSessions ? 'ff_workSessions' : 'NULL AS ff_workSessions'},
         ${hasFfExpedientePausedStatus ? 'ff_expedientePausedStatus' : 'NULL AS ff_expedientePausedStatus'},
+        ${hasFfHistory ? 'ff_history' : 'NULL AS ff_history'},
         data_criacao,
         updated_at
       FROM producao_lotes
@@ -1844,7 +1845,8 @@ app.get('/api/lote/:op', async (req, res) => {
           ff_lotStatus: lote.ff_lotStatus || null,
           ff_sectorEnteredAt: lote.ff_sectorEnteredAt || null,
           ff_workSessions: lote.ff_workSessions || null,
-          ff_expedientePausedStatus: lote.ff_expedientePausedStatus || null
+          ff_expedientePausedStatus: lote.ff_expedientePausedStatus || null,
+          ff_history: lote.ff_history || null
         }
       });
     }
@@ -1961,6 +1963,7 @@ app.get('/api/producao/ativos', async (req, res) => {
           pl.ff_sectorEnteredAt,
           pl.ff_workSessions,
           pl.ff_expedientePausedStatus,
+          pl.ff_history,
 
           COALESCE(
             (
@@ -2269,7 +2272,8 @@ app.patch('/api/producao/:id', async (req, res) => {
       'ff_lotStatus',
       'ff_sectorEnteredAt',
       'ff_workSessions',
-      'ff_expedientePausedStatus'
+      'ff_expedientePausedStatus',
+      'ff_history'
     ];
 
     const body = req.body || {};
@@ -3016,6 +3020,7 @@ app.get('/api/cq/lotes/:op', async (req, res) => {
             ff_sectorEnteredAt: row.ff_sectorEnteredAt || null,
             ff_workSessions: row.ff_workSessions || null,
             ff_expedientePausedStatus: row.ff_expedientePausedStatus || null,
+            ff_history: row.ff_history || null,
           }
         ],
       });
@@ -3110,6 +3115,7 @@ app.get('/api/cq/lote-resumo/:op', async (req, res) => {
           ff_sectorEnteredAt: row.ff_sectorEnteredAt || null,
           ff_workSessions: row.ff_workSessions || null,
           ff_expedientePausedStatus: row.ff_expedientePausedStatus || null,
+          ff_history: row.ff_history || null,
         }
       });
     }
