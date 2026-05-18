@@ -21,24 +21,43 @@ const OPENAI_MODEL = (process.env.OPENAI_MODEL || 'gpt-4.1-mini').trim();
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
-const allowedOrigins = (process.env.CORS_ORIGIN || '')
+const defaultAllowedOrigins = [
+  'https://factoryflowindus.netlify.app',
+  'https://gvfwcjxe.gensparkspace.com',
+  'https://fklqismj.gensparkspace.com',
+  'https://qqjmblcn.gensparkspace.com',
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://localhost:5500',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+  'http://127.0.0.1:5500'
+];
+
+const envAllowedOrigins = (process.env.CORS_ORIGIN || '')
   .split(',')
   .map(origin => origin.trim())
   .filter(Boolean);
 
-app.use(cors({
+const allowedOrigins = [...new Set([...defaultAllowedOrigins, ...envAllowedOrigins])];
+
+const corsOptions = {
   origin: function (origin, callback) {
-    if (!origin) return callback(null, true); // permite Postman/testes
+    if (!origin) return callback(null, true); // permite Postman/testes/curl
 
     if (allowedOrigins.includes(origin)) {
       return callback(null, true);
     }
 
+    console.warn('⚠️ CORS bloqueado para origem:', origin);
     return callback(new Error('CORS bloqueado: origem não autorizada'));
   },
+  credentials: true,
   methods: ['GET', 'PATCH', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key'],
-}));
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+};
+
+app.use(cors(corsOptions));
 function sendError(res, status, message, detail) {
   return res.status(status).json({
     ok: false,
