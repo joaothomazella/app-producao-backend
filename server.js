@@ -1906,80 +1906,44 @@ app.get('/api/lote/:op', async (req, res) => {
 
 
 // =========================
-// PRODUÇÃO - ROTA LEVE PARA ABERTURA DO FACTORYFLOW
+// PRODUÇÃO - ROTA ULTRA LEVE PARA ABERTURA DO FACTORYFLOW
 // =========================
-// Esta rota é usada pelo frontend para abrir o app rápido.
-// Ela evita a query pesada de /api/producao, que faz JOINs, GROUP BY e enrich completo.
-// Para detalhes completos de um lote, continue usando GET /api/producao/:id ou /api/lote/:op.
+// Usada pelo Kanban no carregamento inicial.
+// Não faz COUNT, JOIN, SELECT *, histórico, rotas ou processamento pesado em JS.
+// IMPORTANTE: manter esta rota ANTES de /api/producao/:id.
 app.get('/api/producao/ativos', async (req, res) => {
   try {
-    const hasProducaoLotes = await tableExists('producao_lotes');
-    if (!hasProducaoLotes) {
-      return sendError(
-        res,
-        404,
-        'Tabela producao_lotes não encontrada',
-        'Crie a tabela producao_lotes ou ajuste o nome da tabela no backend.'
-      );
-    }
-
-    const limit = Math.min(toPositiveInt(req.query.limit, 500), 1000);
-    const offset = toPositiveInt(req.query.offset, 0);
-    const status = req.query.status || null;
-    const setor = req.query.setor || null;
-    const search = req.query.search ? `%${req.query.search}%` : null;
-
-    const conditions = [
-      "LOWER(COALESCE(pl.status, '')) NOT IN ('pronto', 'entrega', 'entregue', 'finalizado', 'cancelado', 'rejeitado', 'em_rota')",
-      "LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('pronto', 'entrega', 'entregue', 'finalizado', 'cancelado', 'rejeitado', 'em_rota')"
-    ];
-    const params = [];
-
-    if (status) {
-      conditions.push('pl.status = ?');
-      params.push(status);
-    }
-
-    if (setor) {
-      conditions.push('pl.setor_atual = ?');
-      params.push(setor);
-    }
-
-    if (search) {
-      conditions.push('(pl.cliente_nome LIKE ? OR pl.produto_nome LIKE ? OR pl.numero_pedido LIKE ? OR pl.op LIKE ?)');
-      params.push(search, search, search, search);
-    }
-
-    const where = `WHERE ${conditions.join(' AND ')}`;
+    const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 300), 1), 500);
 
     const [rows] = await dbPool.query(
       `
         SELECT
-          pl.id,
-          pl.numero_pedido,
-          pl.op,
-          pl.produto_codigo,
-          pl.produto_nome,
-          pl.quantidade,
-          pl.cliente_nome,
-          pl.status,
-          pl.setor_atual,
-          pl.data_criacao,
-          pl.updated_at,
-          pl.linha_produto
-        FROM producao_lotes pl
-        ${where}
-        ORDER BY pl.updated_at DESC, pl.data_criacao DESC, pl.id DESC
-        LIMIT ? OFFSET ?
+          id,
+          op,
+          numero_pedido,
+          produto_codigo,
+          produto_nome,
+          cliente_nome,
+          quantidade,
+          setor_atual,
+          status,
+          linha_produto,
+          data_criacao,
+          updated_at
+        FROM producao_lotes
+        WHERE
+          LOWER(COALESCE(status, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
+          AND LOWER(COALESCE(setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
+        ORDER BY id DESC
+        LIMIT ?
       `,
-      [...params, limit, offset]
+      [limit]
     );
 
     return res.json({
       ok: true,
       total: rows.length,
       limit,
-      offset,
       mode: 'fast',
       data: rows,
     });
