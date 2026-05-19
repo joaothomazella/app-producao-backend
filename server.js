@@ -1923,14 +1923,15 @@ app.get('/api/producao/ativos', async (req, res) => {
       );
     }
 
-    const limit = Math.min(toPositiveInt(req.query.limit, 300), 1000);
+    const limit = Math.min(toPositiveInt(req.query.limit, 500), 1000);
     const offset = toPositiveInt(req.query.offset, 0);
     const status = req.query.status || null;
     const setor = req.query.setor || null;
     const search = req.query.search ? `%${req.query.search}%` : null;
 
     const conditions = [
-      "LOWER(COALESCE(pl.status, '')) NOT IN ('finalizado', 'cancelado', 'rejeitado')"
+      "LOWER(COALESCE(pl.status, '')) NOT IN ('pronto', 'entrega', 'entregue', 'finalizado', 'cancelado', 'rejeitado', 'em_rota')",
+      "LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('pronto', 'entrega', 'entregue', 'finalizado', 'cancelado', 'rejeitado', 'em_rota')"
     ];
     const params = [];
 
@@ -1959,61 +1960,13 @@ app.get('/api/producao/ativos', async (req, res) => {
           pl.op,
           pl.produto_codigo,
           pl.produto_nome,
-          pl.tipo_lote,
           pl.quantidade,
-          pl.cliente_codigo,
           pl.cliente_nome,
-          pl.cliente_endereco,
-          pl.cliente_bairro,
-          pl.cliente_cidade,
-          pl.cliente_cep,
-          pl.cliente_estado,
           pl.status,
-          pl.prioridade,
-          pl.classificado_pcp,
-          pl.liberado_pcp,
           pl.setor_atual,
           pl.data_criacao,
           pl.updated_at,
-          pl.origem,
-          pl.linha_produto,
-          pl.cq_status,
-          pl.ff_lotStatus,
-          pl.ff_sectorEnteredAt,
-          pl.ff_workSessions,
-          pl.ff_expedientePausedStatus,
-          pl.ff_history,
-
-          COALESCE(
-            (
-              SELECT p1.pits_previsao
-              FROM cli_pedidos_itens p1
-              WHERE TRIM(p1.pits_op) = TRIM(pl.op)
-              ORDER BY p1.id ASC
-              LIMIT 1
-            ),
-            (
-              SELECT MIN(p2.pits_previsao)
-              FROM cli_pedidos_itens p2
-              WHERE TRIM(p2.pits_numero) = TRIM(pl.numero_pedido)
-            )
-          ) AS pits_previsao,
-
-          COALESCE(
-            (
-              SELECT p1.pits_previsao
-              FROM cli_pedidos_itens p1
-              WHERE TRIM(p1.pits_op) = TRIM(pl.op)
-              ORDER BY p1.id ASC
-              LIMIT 1
-            ),
-            (
-              SELECT MIN(p2.pits_previsao)
-              FROM cli_pedidos_itens p2
-              WHERE TRIM(p2.pits_numero) = TRIM(pl.numero_pedido)
-            )
-          ) AS previsao_entrega
-
+          pl.linha_produto
         FROM producao_lotes pl
         ${where}
         ORDER BY pl.updated_at DESC, pl.data_criacao DESC, pl.id DESC
@@ -2022,24 +1975,199 @@ app.get('/api/producao/ativos', async (req, res) => {
       [...params, limit, offset]
     );
 
-    const data = rows.map((row) => ({
-      ...row,
-      deliveryDate: row.pits_previsao || row.previsao_entrega || null,
-      delivery_date: row.pits_previsao || row.previsao_entrega || null,
-      data_entrega: row.pits_previsao || row.previsao_entrega || null,
-    }));
-
     return res.json({
       ok: true,
-      total: data.length,
+      total: rows.length,
       limit,
       offset,
       mode: 'fast',
-      data,
+      data: rows,
     });
   } catch (err) {
     console.error('GET /api/producao/ativos erro:', err.message);
     return sendError(res, 500, 'Erro ao buscar lotes ativos de produção', err.message);
+  }
+});
+
+app.get('/api/producao/historico', async (req, res) => {
+  try {
+    const hasProducaoLotes = await tableExists('producao_lotes');
+    if (!hasProducaoLotes) {
+      return sendError(res, 404, 'Tabela producao_lotes nÃ£o encontrada');
+    }
+
+    const page = Math.max(toPositiveInt(req.query.page, 1), 1);
+    const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 100), 1), 500);
+    const offset = (page - 1) * limit;
+    const conditions = [];
+    const params = [];
+
+    if (req.query.inicio) {
+      conditions.push('DATE(pl.data_criacao) >= ?');
+      params.push(String(req.query.inicio).slice(0, 10));
+    }
+    if (req.query.fim) {
+      conditions.push('DATE(pl.data_criacao) <= ?');
+      params.push(String(req.query.fim).slice(0, 10));
+    }
+    if (req.query.status) {
+      conditions.push("LOWER(COALESCE(pl.status, '')) = LOWER(?)");
+      params.push(String(req.query.status));
+    }
+    if (req.query.setor) {
+      conditions.push("LOWER(COALESCE(pl.setor_atual, '')) = LOWER(?)");
+      params.push(String(req.query.setor));
+    }
+    if (req.query.op) {
+      conditions.push('TRIM(pl.op) = TRIM(?)');
+      params.push(String(req.query.op));
+    }
+    if (req.query.pedido) {
+      conditions.push('TRIM(pl.numero_pedido) = TRIM(?)');
+      params.push(String(req.query.pedido));
+    }
+    if (req.query.cliente) {
+      conditions.push('pl.cliente_nome LIKE ?');
+      params.push(`%${String(req.query.cliente)}%`);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const [[{ total }]] = await dbPool.query(
+      `SELECT COUNT(*) AS total FROM producao_lotes pl ${where}`,
+      params
+    );
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          pl.id,
+          pl.op,
+          pl.numero_pedido,
+          pl.produto_codigo,
+          pl.produto_nome,
+          pl.cliente_nome,
+          pl.quantidade,
+          pl.setor_atual,
+          pl.status,
+          pl.linha_produto,
+          pl.tipo_lote,
+          pl.prioridade,
+          pl.data_criacao,
+          pl.updated_at
+        FROM producao_lotes pl
+        ${where}
+        ORDER BY pl.updated_at DESC, pl.data_criacao DESC, pl.id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    res.json({
+      ok: true,
+      page,
+      limit,
+      offset,
+      total: Number(total || 0),
+      total_pages: Math.ceil(Number(total || 0) / limit),
+      data: rows,
+    });
+  } catch (err) {
+    console.error('GET /api/producao/historico erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar histÃ³rico de produÃ§Ã£o', err.message);
+  }
+});
+
+app.get('/api/producao/metricas', async (req, res) => {
+  try {
+    const hasProducaoLotes = await tableExists('producao_lotes');
+    if (!hasProducaoLotes) {
+      return sendError(res, 404, 'Tabela producao_lotes nÃ£o encontrada');
+    }
+
+    const conditions = [];
+    const params = [];
+    if (req.query.inicio) {
+      conditions.push('DATE(data_criacao) >= ?');
+      params.push(String(req.query.inicio).slice(0, 10));
+    }
+    if (req.query.fim) {
+      conditions.push('DATE(data_criacao) <= ?');
+      params.push(String(req.query.fim).slice(0, 10));
+    }
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [[summary]] = await dbPool.query(
+      `
+        SELECT
+          COUNT(*) AS total_lotes,
+          COALESCE(SUM(COALESCE(quantidade, 0)), 0) AS total_kg,
+          SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'entregue'
+                    OR LOWER(COALESCE(setor_atual, '')) = 'entregue' THEN 1 ELSE 0 END) AS lotes_entregues,
+          SUM(CASE WHEN LOWER(COALESCE(status, '')) = 'finalizado'
+                    OR LOWER(COALESCE(setor_atual, '')) = 'finalizado' THEN 1 ELSE 0 END) AS lotes_finalizados,
+          AVG(CASE
+                WHEN data_criacao IS NOT NULL AND updated_at IS NOT NULL
+                  THEN TIMESTAMPDIFF(SECOND, data_criacao, updated_at)
+                ELSE NULL
+              END) AS tempo_medio_producao_segundos
+        FROM producao_lotes
+        ${where}
+      `,
+      params
+    );
+
+    const [statusRows] = await dbPool.query(
+      `
+        SELECT COALESCE(NULLIF(TRIM(status), ''), 'sem_status') AS status, COUNT(*) AS total
+        FROM producao_lotes
+        ${where}
+        GROUP BY COALESCE(NULLIF(TRIM(status), ''), 'sem_status')
+        ORDER BY total DESC
+      `,
+      params
+    );
+
+    const [setorRows] = await dbPool.query(
+      `
+        SELECT COALESCE(NULLIF(TRIM(setor_atual), ''), 'sem_setor') AS setor, COUNT(*) AS total
+        FROM producao_lotes
+        ${where}
+        GROUP BY COALESCE(NULLIF(TRIM(setor_atual), ''), 'sem_setor')
+        ORDER BY total DESC
+      `,
+      params
+    );
+
+    const [linhaRows] = await dbPool.query(
+      `
+        SELECT COALESCE(NULLIF(TRIM(linha_produto), ''), 'sem_linha') AS linha_produto,
+               COALESCE(SUM(COALESCE(quantidade, 0)), 0) AS kg
+        FROM producao_lotes
+        ${where}
+        GROUP BY COALESCE(NULLIF(TRIM(linha_produto), ''), 'sem_linha')
+        ORDER BY kg DESC
+      `,
+      params
+    );
+
+    res.json({
+      ok: true,
+      inicio: req.query.inicio || null,
+      fim: req.query.fim || null,
+      total_lotes: Number(summary.total_lotes || 0),
+      total_kg: Number(summary.total_kg || 0),
+      lotes_por_status: statusRows.map(r => ({ status: r.status, total: Number(r.total || 0) })),
+      lotes_por_setor: setorRows.map(r => ({ setor: r.setor, total: Number(r.total || 0) })),
+      kg_por_linha_produto: linhaRows.map(r => ({ linha_produto: r.linha_produto, kg: Number(r.kg || 0) })),
+      lotes_entregues: Number(summary.lotes_entregues || 0),
+      lotes_finalizados: Number(summary.lotes_finalizados || 0),
+      tempo_medio_producao: summary.tempo_medio_producao_segundos == null
+        ? null
+        : Number(summary.tempo_medio_producao_segundos),
+    });
+  } catch (err) {
+    console.error('GET /api/producao/metricas erro:', err.message);
+    sendError(res, 500, 'Erro ao calcular mÃ©tricas de produÃ§Ã£o', err.message);
   }
 });
 
