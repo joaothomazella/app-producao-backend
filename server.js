@@ -167,6 +167,10 @@ async function ensureProductionLotesTimeColumns() {
     {
       name: 'ff_history',
       sql: `ALTER TABLE producao_lotes ADD COLUMN ff_history LONGTEXT NULL`
+    },
+    {
+      name: 'ff_sectorMetrics',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_sectorMetrics LONGTEXT NULL`
     }
   ];
 
@@ -204,6 +208,7 @@ async function getProductionLoteByOp(op) {
   const hasFfWorkSessions = await columnExists('producao_lotes', 'ff_workSessions');
   const hasFfExpedientePausedStatus = await columnExists('producao_lotes', 'ff_expedientePausedStatus');
   const hasFfHistory = await columnExists('producao_lotes', 'ff_history');
+  const hasFfSectorMetrics = await columnExists('producao_lotes', 'ff_sectorMetrics');
 
   const [rows] = await dbPool.query(
     `
@@ -229,6 +234,7 @@ async function getProductionLoteByOp(op) {
         ${hasFfWorkSessions ? 'ff_workSessions' : 'NULL AS ff_workSessions'},
         ${hasFfExpedientePausedStatus ? 'ff_expedientePausedStatus' : 'NULL AS ff_expedientePausedStatus'},
         ${hasFfHistory ? 'ff_history' : 'NULL AS ff_history'},
+        ${hasFfSectorMetrics ? 'ff_sectorMetrics' : 'NULL AS ff_sectorMetrics'},
         data_criacao,
         updated_at
       FROM producao_lotes
@@ -1928,6 +1934,11 @@ app.get('/api/producao/ativos', async (req, res) => {
           setor_atual,
           status,
           linha_produto,
+          ff_lotStatus,
+          ff_sectorEnteredAt,
+          ff_workSessions,
+          ff_history,
+          ff_sectorMetrics,
           data_criacao,
           updated_at
         FROM producao_lotes
@@ -1950,6 +1961,108 @@ app.get('/api/producao/ativos', async (req, res) => {
   } catch (err) {
     console.error('GET /api/producao/ativos erro:', err.message);
     return sendError(res, 500, 'Erro ao buscar lotes ativos de produção', err.message);
+  }
+});
+
+
+app.get('/api/producao/metricas/codigo/:codigo', async (req, res) => {
+  try {
+    const codigo = String(req.params.codigo || '').trim();
+    const setor = String(req.query.setor || '').trim().toLowerCase();
+    const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 200), 1), 1000);
+
+    if (!codigo) return sendError(res, 400, 'Informe o código do produto');
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          id,
+          op,
+          produto_codigo,
+          produto_nome,
+          ff_sectorMetrics,
+          ff_workSessions,
+          ff_history
+        FROM producao_lotes
+        WHERE TRIM(produto_codigo) = TRIM(?)
+        ORDER BY id DESC
+        LIMIT ?
+      `,
+      [codigo, limit]
+    );
+
+    const normalize = (v) => String(v || '')
+      .toLowerCase()
+      .trim()
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '');
+
+    const parseArr = (value) => {
+      if (Array.isArray(value)) return value;
+      if (typeof value === 'string' && value.trim()) {
+        try {
+          const parsed = JSON.parse(value);
+          return Array.isArray(parsed) ? parsed : [];
+        } catch (_) { return []; }
+      }
+      return [];
+    };
+
+    const metrics = [];
+    for (const row of rows) {
+      const arr = parseArr(row.ff_sectorMetrics);
+      for (const m of arr) {
+        if (setor && normalize(m.sector) !== normalize(setor)) continue;
+        if (Number(m.workedMs || 0) <= 0 && Number(m.totalMs || 0) <= 0) continue;
+        metrics.push({
+          ...m,
+          op: m.op || row.op,
+          produto_codigo: row.produto_codigo,
+          produto_nome: row.produto_nome
+        });
+      }
+    }
+
+    if (!metrics.length) {
+      return res.json({
+        ok: true,
+        data: {
+          codigo,
+          setor: setor || null,
+          count: 0,
+          avgTotalMs: 0,
+          avgWorkedMs: 0,
+          avgPausedMs: 0,
+          avgIdleMs: 0,
+          samples: []
+        }
+      });
+    }
+
+    const sum = metrics.reduce((acc, m) => {
+      acc.totalMs += Number(m.totalMs || 0);
+      acc.workedMs += Number(m.workedMs || 0);
+      acc.pausedMs += Number(m.pausedMs || 0);
+      acc.idleMs += Number(m.idleMs || 0);
+      return acc;
+    }, { totalMs: 0, workedMs: 0, pausedMs: 0, idleMs: 0 });
+
+    return res.json({
+      ok: true,
+      data: {
+        codigo,
+        setor: setor || null,
+        count: metrics.length,
+        avgTotalMs: sum.totalMs / metrics.length,
+        avgWorkedMs: sum.workedMs / metrics.length,
+        avgPausedMs: sum.pausedMs / metrics.length,
+        avgIdleMs: sum.idleMs / metrics.length,
+        samples: metrics.slice(-20)
+      }
+    });
+  } catch (err) {
+    console.error('GET /api/producao/metricas/codigo/:codigo erro:', err.message);
+    return sendError(res, 500, 'Erro ao buscar métricas por código', err.message);
   }
 });
 
@@ -2384,7 +2497,8 @@ app.patch('/api/producao/:id', async (req, res) => {
       'ff_sectorEnteredAt',
       'ff_workSessions',
       'ff_expedientePausedStatus',
-      'ff_history'
+      'ff_history',
+      'ff_sectorMetrics'
     ];
 
     const body = req.body || {};
