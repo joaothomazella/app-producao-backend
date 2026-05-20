@@ -988,6 +988,184 @@ app.get('/webhook/whatsapp', (req, res) => {
 });
 
 
+
+// =========================
+// LOGIN PÚBLICO - precisa ficar ANTES do requireApiToken
+// =========================
+// IMPORTANTE:
+// O usuário ainda não tem JWT antes de fazer login.
+// Por isso /api/login NÃO pode ficar depois de app.use('/api', requireApiToken).
+
+function fnv1a32FactoryFlow(str) {
+  let hash = 0x811c9dc5;
+  const text = String(str || '');
+  for (let i = 0; i < text.length; i++) {
+    hash ^= text.charCodeAt(i);
+    hash = Math.imul(hash, 0x01000193);
+  }
+  return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+async function checkFactoryFlowPassword(senhaDigitada, senhaHashSalva) {
+  const senha = String(senhaDigitada || '');
+  const saved = String(senhaHashSalva || '').trim();
+
+  if (!senha || !saved) return false;
+
+  // 1) bcrypt/bcryptjs, caso o usuário esteja salvo com hash bcrypt.
+  if (saved.startsWith('$2a$') || saved.startsWith('$2b$') || saved.startsWith('$2y$')) {
+    try {
+      const bcrypt = require('bcryptjs');
+      if (await bcrypt.compare(senha, saved)) return true;
+    } catch (err) {
+      console.warn('⚠️ bcryptjs não disponível para comparar senha:', err.message);
+    }
+  }
+
+  // 2) Comparação direta para sistemas antigos com senha em texto puro.
+  if (safeEqual(senha, saved)) return true;
+
+  // 3) SHA-256 e MD5 para compatibilidade.
+  const sha256 = crypto.createHash('sha256').update(senha).digest('hex');
+  if (safeEqual(sha256, saved)) return true;
+
+  const md5 = crypto.createHash('md5').update(senha).digest('hex');
+  if (safeEqual(md5, saved)) return true;
+
+  // 4) Compatibilidade com FNV-1a antigo usado em alguns módulos frontend.
+  const fnv = fnv1a32FactoryFlow(senha);
+  if (safeEqual(fnv, saved)) return true;
+
+  // 5) Compatibilidade com formatos salt:hash, salt$hash ou salt.hash.
+  const parts = saved.split(/[:$.]/).filter(Boolean);
+  if (parts.length >= 2) {
+    const salt = parts[0];
+    const hash = parts.slice(1).join('');
+
+    if (safeEqual(fnv1a32FactoryFlow(salt + senha), hash)) return true;
+    if (safeEqual(fnv1a32FactoryFlow(senha + salt), hash)) return true;
+    if (safeEqual(crypto.createHash('sha256').update(salt + senha).digest('hex'), hash)) return true;
+    if (safeEqual(crypto.createHash('sha256').update(senha + salt).digest('hex'), hash)) return true;
+    if (safeEqual(crypto.createHash('md5').update(salt + senha).digest('hex'), hash)) return true;
+    if (safeEqual(crypto.createHash('md5').update(senha + salt).digest('hex'), hash)) return true;
+  }
+
+  return false;
+}
+
+app.post('/api/login', async (req, res) => {
+  try {
+    const usuario = String(
+      req.body.usuario ||
+      req.body.login ||
+      req.body.username ||
+      req.body.user ||
+      ''
+    ).trim().toLowerCase();
+
+    const senha = String(
+      req.body.senha ||
+      req.body.password ||
+      req.body.pass ||
+      ''
+    ).trim();
+
+    if (!usuario || !senha) {
+      return sendError(res, 400, 'Informe usuário e senha');
+    }
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          id,
+          nome,
+          usuario,
+          senha_hash,
+          role,
+          acesso_factoryflow,
+          acesso_paintlab,
+          acesso_cqvision,
+          ativo
+        FROM users
+        WHERE LOWER(TRIM(usuario)) = ?
+        LIMIT 1
+      `,
+      [usuario]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 401, 'Usuário ou senha incorretos');
+    }
+
+    const user = rows[0];
+
+    if (Number(user.ativo) !== 1) {
+      return sendError(res, 403, 'Usuário inativo');
+    }
+
+    const senhaOk = await checkFactoryFlowPassword(senha, user.senha_hash);
+
+    if (!senhaOk) {
+      return sendError(res, 401, 'Usuário ou senha incorretos');
+    }
+
+    const apps = [];
+    if (String(user.acesso_factoryflow || '').trim()) apps.push('factoryflow');
+    if (String(user.acesso_paintlab || '').trim()) apps.push('paintlab');
+    if (String(user.acesso_cqvision || '').trim()) apps.push('cqvision');
+
+    // Se por algum motivo o acesso específico estiver vazio, libera FactoryFlow para perfis operacionais conhecidos.
+    const roleNormalizada = String(user.role || '').trim().toLowerCase();
+    const rolesFactoryFlow = new Set([
+      'admin', 'administrador', 'diretoria', 'gerente', 'manager',
+      'pcp', 'pcp_lib', 'pcplib', 'operador', 'sector', 'setor',
+      'motorista', 'driver', 'tv', 'viewer', 'visualizador'
+    ]);
+    if (!apps.includes('factoryflow') && rolesFactoryFlow.has(roleNormalizada)) {
+      apps.push('factoryflow');
+    }
+
+    const payload = {
+      id: user.id,
+      nome: user.nome,
+      name: user.nome,
+      usuario: user.usuario,
+      username: user.usuario,
+      login: user.usuario,
+      role: user.role,
+      acesso_factoryflow: user.acesso_factoryflow || '',
+      acesso_paintlab: user.acesso_paintlab || '',
+      acesso_cqvision: user.acesso_cqvision || '',
+      apps
+    };
+
+    const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+    const body = base64UrlEncode(JSON.stringify({
+      ...payload,
+      iat: Math.floor(Date.now() / 1000),
+      exp: Math.floor(Date.now() / 1000) + (8 * 60 * 60)
+    }));
+
+    const signature = base64UrlEncode(
+      crypto
+        .createHmac('sha256', JWT_SECRET)
+        .update(`${header}.${body}`)
+        .digest()
+    );
+
+    const token = `${header}.${body}.${signature}`;
+
+    return res.json({
+      ok: true,
+      token,
+      user: payload
+    });
+  } catch (err) {
+    console.error('❌ Erro em POST /api/login:', err);
+    return sendError(res, 500, 'Erro ao fazer login', err.message);
+  }
+});
+
 // A partir daqui, toda rota /api exige token.
 app.use('/api', requireApiToken);
 
