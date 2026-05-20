@@ -992,83 +992,91 @@ app.get('/webhook/whatsapp', (req, res) => {
 // =========================
 // LOGIN PÚBLICO - precisa ficar ANTES do requireApiToken
 // =========================
-// IMPORTANTE:
-// O usuário ainda não tem JWT antes de fazer login.
-// Por isso /api/login NÃO pode ficar depois de app.use('/api', requireApiToken).
+// Motivo: o usuário ainda não tem JWT antes de logar.
+// Esta rota aceita as senhas antigas do FactoryFlow, inclusive formato "salt:hash" FNV usado no frontend.
 
-function fnv1a32FactoryFlow(str) {
+function fnv1a32Server(str) {
   let hash = 0x811c9dc5;
-  const text = String(str || '');
-  for (let i = 0; i < text.length; i++) {
-    hash ^= text.charCodeAt(i);
+  const input = String(str || '');
+  for (let i = 0; i < input.length; i++) {
+    hash ^= input.charCodeAt(i);
     hash = Math.imul(hash, 0x01000193);
+    hash = hash >>> 0;
   }
-  return (hash >>> 0).toString(16).padStart(8, '0');
+  return hash.toString(16).padStart(8, '0');
 }
 
-async function checkFactoryFlowPassword(senhaDigitada, senhaHashSalva) {
-  const senha = String(senhaDigitada || '');
-  const saved = String(senhaHashSalva || '').trim();
+function hashPasswordFNVServer(password, salt) {
+  const pwd = String(password || '');
+  const s = String(salt || '');
+  let h = fnv1a32Server(s + pwd);
+  for (let r = 0; r < 3; r++) {
+    h = fnv1a32Server(s + h + pwd);
+  }
+  return `${s}:${h}`;
+}
 
-  if (!senha || !saved) return false;
+async function verifyFactoryFlowPassword(enteredPassword, storedHash) {
+  const senha = String(enteredPassword || '');
+  const stored = String(storedHash || '');
 
-  // 1) bcrypt/bcryptjs, caso o usuário esteja salvo com hash bcrypt.
-  if (saved.startsWith('$2a$') || saved.startsWith('$2b$') || saved.startsWith('$2y$')) {
+  if (!senha || !stored) return false;
+
+  // 1) Formato antigo/atual do FactoryFlow frontend: "salt:hash" com FNV-1a.
+  // Exemplo: abcdef1234567890:1a2b3c4d
+  if (stored.includes(':')) {
+    const [salt] = stored.split(':');
+    if (safeEqual(hashPasswordFNVServer(senha, salt), stored)) return true;
+  }
+
+  // 2) Bcrypt, caso algum usuário tenha sido gerado assim.
+  if (stored.startsWith('$2')) {
     try {
       const bcrypt = require('bcryptjs');
-      if (await bcrypt.compare(senha, saved)) return true;
-    } catch (err) {
-      console.warn('⚠️ bcryptjs não disponível para comparar senha:', err.message);
+      if (await bcrypt.compare(senha, stored)) return true;
+    } catch (_) {
+      // bcryptjs pode não estar instalado; não deve derrubar o login.
     }
   }
 
-  // 2) Comparação direta para sistemas antigos com senha em texto puro.
-  if (safeEqual(senha, saved)) return true;
-
-  // 3) SHA-256 e MD5 para compatibilidade.
+  // 3) SHA-256.
   const sha256 = crypto.createHash('sha256').update(senha).digest('hex');
-  if (safeEqual(sha256, saved)) return true;
+  if (safeEqual(sha256, stored)) return true;
 
+  // 4) MD5 legado.
   const md5 = crypto.createHash('md5').update(senha).digest('hex');
-  if (safeEqual(md5, saved)) return true;
+  if (safeEqual(md5, stored)) return true;
 
-  // 4) Compatibilidade com FNV-1a antigo usado em alguns módulos frontend.
-  const fnv = fnv1a32FactoryFlow(senha);
-  if (safeEqual(fnv, saved)) return true;
-
-  // 5) Compatibilidade com formatos salt:hash, salt$hash ou salt.hash.
-  const parts = saved.split(/[:$.]/).filter(Boolean);
-  if (parts.length >= 2) {
-    const salt = parts[0];
-    const hash = parts.slice(1).join('');
-
-    if (safeEqual(fnv1a32FactoryFlow(salt + senha), hash)) return true;
-    if (safeEqual(fnv1a32FactoryFlow(senha + salt), hash)) return true;
-    if (safeEqual(crypto.createHash('sha256').update(salt + senha).digest('hex'), hash)) return true;
-    if (safeEqual(crypto.createHash('sha256').update(senha + salt).digest('hex'), hash)) return true;
-    if (safeEqual(crypto.createHash('md5').update(salt + senha).digest('hex'), hash)) return true;
-    if (safeEqual(crypto.createHash('md5').update(senha + salt).digest('hex'), hash)) return true;
-  }
+  // 5) Texto puro legado.
+  if (safeEqual(senha, stored)) return true;
 
   return false;
 }
 
+function signFactoryFlowJwt(payload) {
+  const now = Math.floor(Date.now() / 1000);
+
+  const headerEncoded = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
+  const payloadEncoded = base64UrlEncode(JSON.stringify({
+    ...payload,
+    iat: now,
+    exp: now + (8 * 60 * 60)
+  }));
+
+  const signature = base64UrlEncode(
+    crypto
+      .createHmac('sha256', JWT_SECRET)
+      .update(`${headerEncoded}.${payloadEncoded}`)
+      .digest()
+  );
+
+  return `${headerEncoded}.${payloadEncoded}.${signature}`;
+}
+
 app.post('/api/login', async (req, res) => {
   try {
-    const usuario = String(
-      req.body.usuario ||
-      req.body.login ||
-      req.body.username ||
-      req.body.user ||
-      ''
-    ).trim().toLowerCase();
-
-    const senha = String(
-      req.body.senha ||
-      req.body.password ||
-      req.body.pass ||
-      ''
-    ).trim();
+    const usuario = String(req.body.usuario || req.body.login || req.body.username || '').trim().toLowerCase();
+    const senha = String(req.body.senha || req.body.password || '').trim();
 
     if (!usuario || !senha) {
       return sendError(res, 400, 'Informe usuário e senha');
@@ -1103,8 +1111,7 @@ app.post('/api/login', async (req, res) => {
       return sendError(res, 403, 'Usuário inativo');
     }
 
-    const senhaOk = await checkFactoryFlowPassword(senha, user.senha_hash);
-
+    const senhaOk = await verifyFactoryFlowPassword(senha, user.senha_hash);
     if (!senhaOk) {
       return sendError(res, 401, 'Usuário ou senha incorretos');
     }
@@ -1114,24 +1121,23 @@ app.post('/api/login', async (req, res) => {
     if (String(user.acesso_paintlab || '').trim()) apps.push('paintlab');
     if (String(user.acesso_cqvision || '').trim()) apps.push('cqvision');
 
-    // Se por algum motivo o acesso específico estiver vazio, libera FactoryFlow para perfis operacionais conhecidos.
-    const roleNormalizada = String(user.role || '').trim().toLowerCase();
-    const rolesFactoryFlow = new Set([
-      'admin', 'administrador', 'diretoria', 'gerente', 'manager',
-      'pcp', 'pcp_lib', 'pcplib', 'operador', 'sector', 'setor',
-      'motorista', 'driver', 'tv', 'viewer', 'visualizador'
-    ]);
-    if (!apps.includes('factoryflow') && rolesFactoryFlow.has(roleNormalizada)) {
+    // Compatibilidade: se for admin/gerente/pcp/operador mas o campo de acesso estiver vazio,
+    // ainda libera o FactoryFlow para não bloquear usuários antigos da empresa.
+    const roleNorm = String(user.role || '').toLowerCase().trim();
+    if (!apps.includes('factoryflow') && [
+      'admin', 'administrador', 'diretoria', 'pcp', 'pcp_lib', 'gerente', 'manager',
+      'sector', 'setor', 'operador', 'driver', 'motorista', 'tv', 'viewer', 'visualizador'
+    ].includes(roleNorm)) {
       apps.push('factoryflow');
     }
 
     const payload = {
       id: user.id,
+      usuario: user.usuario,
+      login: user.usuario,
+      username: user.usuario,
       nome: user.nome,
       name: user.nome,
-      usuario: user.usuario,
-      username: user.usuario,
-      login: user.usuario,
       role: user.role,
       acesso_factoryflow: user.acesso_factoryflow || '',
       acesso_paintlab: user.acesso_paintlab || '',
@@ -1139,21 +1145,7 @@ app.post('/api/login', async (req, res) => {
       apps
     };
 
-    const header = base64UrlEncode(JSON.stringify({ alg: 'HS256', typ: 'JWT' }));
-    const body = base64UrlEncode(JSON.stringify({
-      ...payload,
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + (8 * 60 * 60)
-    }));
-
-    const signature = base64UrlEncode(
-      crypto
-        .createHmac('sha256', JWT_SECRET)
-        .update(`${header}.${body}`)
-        .digest()
-    );
-
-    const token = `${header}.${body}.${signature}`;
+    const token = signFactoryFlowJwt(payload);
 
     return res.json({
       ok: true,
