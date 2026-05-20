@@ -1075,77 +1075,194 @@ function signFactoryFlowJwt(payload) {
 
 app.post('/api/login', async (req, res) => {
   try {
-    const usuario = String(req.body.usuario || req.body.login || req.body.username || '').trim().toLowerCase();
-    const senha = String(req.body.senha || req.body.password || '').trim();
+    const usuario = String(
+      req.body.usuario || req.body.login || req.body.username || req.body.email || ''
+    ).trim().toLowerCase();
+
+    // Não usa .trim() na senha para evitar falha caso alguma senha antiga tenha espaço.
+    const senha = String(req.body.senha || req.body.password || '');
 
     if (!usuario || !senha) {
       return sendError(res, 400, 'Informe usuário e senha');
     }
 
+    const hasUsersTable = await tableExists('users');
+    if (!hasUsersTable) {
+      console.error('❌ Login falhou: tabela users não existe.');
+      return sendError(res, 500, 'Tabela de usuários não encontrada');
+    }
+
+    const [columnsRows] = await dbPool.query(
+      `
+        SELECT column_name
+        FROM information_schema.columns
+        WHERE table_schema = DATABASE()
+          AND table_name = 'users'
+      `
+    );
+
+    const userColumns = new Set(
+      columnsRows.map(row => String(row.column_name || row.COLUMN_NAME || '').trim())
+    );
+
+    const existing = (names) => names.filter(name => userColumns.has(name));
+
+    const loginColumns = existing(['usuario', 'login', 'username', 'email']);
+    const passwordColumns = existing(['senha_hash', 'password_hash', 'senha', 'password', 'pass_hash']);
+
+    if (!loginColumns.length) {
+      console.error('❌ Login falhou: nenhuma coluna de usuário encontrada em users. Esperado: usuario/login/username/email');
+      return sendError(res, 500, 'Configuração de login inválida: coluna de usuário não encontrada');
+    }
+
+    if (!passwordColumns.length) {
+      console.error('❌ Login falhou: nenhuma coluna de senha encontrada em users. Esperado: senha_hash/password_hash/senha/password/pass_hash');
+      return sendError(res, 500, 'Configuração de login inválida: coluna de senha não encontrada');
+    }
+
+    const whereLogin = loginColumns
+      .map(col => `LOWER(TRIM(CAST(\`${col}\` AS CHAR))) = ?`)
+      .join(' OR ');
+
     const [rows] = await dbPool.query(
       `
-        SELECT
-          id,
-          nome,
-          usuario,
-          senha_hash,
-          role,
-          acesso_factoryflow,
-          acesso_paintlab,
-          acesso_cqvision,
-          ativo
+        SELECT *
         FROM users
-        WHERE LOWER(TRIM(usuario)) = ?
+        WHERE ${whereLogin}
         LIMIT 1
       `,
-      [usuario]
+      loginColumns.map(() => usuario)
     );
 
     if (!rows.length) {
+      console.warn('⚠️ Login recusado: usuário não encontrado:', usuario);
       return sendError(res, 401, 'Usuário ou senha incorretos');
     }
 
     const user = rows[0];
 
-    if (Number(user.ativo) !== 1) {
-      return sendError(res, 403, 'Usuário inativo');
+    if (userColumns.has('ativo')) {
+      const ativoRaw = String(user.ativo ?? '').trim().toLowerCase();
+
+      const ativoOk =
+        ativoRaw === '' ||
+        ativoRaw === '1' ||
+        ativoRaw === 'true' ||
+        ativoRaw === 'sim' ||
+        ativoRaw === 's' ||
+        ativoRaw === 'ativo';
+
+      if (!ativoOk) {
+        console.warn('⚠️ Login recusado: usuário inativo:', usuario);
+        return sendError(res, 403, 'Usuário inativo');
+      }
     }
 
-    const senhaOk = await verifyFactoryFlowPassword(senha, user.senha_hash);
-    if (!senhaOk) {
+    const passwordColumnUsed = passwordColumns.find(col => String(user[col] || '').length > 0);
+    const storedPassword = passwordColumnUsed ? user[passwordColumnUsed] : '';
+
+    if (!storedPassword) {
+      console.warn('⚠️ Login recusado: usuário sem senha cadastrada:', usuario);
       return sendError(res, 401, 'Usuário ou senha incorretos');
     }
 
+    const senhaOk = await verifyFactoryFlowPassword(senha, storedPassword);
+
+    if (!senhaOk) {
+      console.warn(
+        '⚠️ Login recusado: senha inválida para',
+        usuario,
+        '| coluna usada:',
+        passwordColumnUsed,
+        '| formato:',
+        String(storedPassword || '').includes(':') ? 'salt:hash' :
+          String(storedPassword || '').startsWith('$2') ? 'bcrypt' :
+          String(storedPassword || '').length === 64 ? 'sha256' :
+          String(storedPassword || '').length === 32 ? 'md5' :
+          'texto/legado'
+      );
+      return sendError(res, 401, 'Usuário ou senha incorretos');
+    }
+
+    const userLogin =
+      user.usuario ||
+      user.login ||
+      user.username ||
+      user.email ||
+      usuario;
+
+    const userName =
+      user.nome ||
+      user.name ||
+      user.full_name ||
+      userLogin ||
+      'Usuário';
+
+    const acessoFactoryFlow =
+      user.acesso_factoryflow ||
+      user.factoryflow_access ||
+      user.acessoFactoryFlow ||
+      user.acesso_factory ||
+      '';
+
+    const acessoPaintLab =
+      user.acesso_paintlab ||
+      user.paintlab_access ||
+      user.acessoPaintLab ||
+      '';
+
+    const acessoCqVision =
+      user.acesso_cqvision ||
+      user.cqvision_access ||
+      user.acessoCqVision ||
+      '';
+
     const apps = [];
-    if (String(user.acesso_factoryflow || '').trim()) apps.push('factoryflow');
-    if (String(user.acesso_paintlab || '').trim()) apps.push('paintlab');
-    if (String(user.acesso_cqvision || '').trim()) apps.push('cqvision');
+    if (String(acessoFactoryFlow || '').trim()) apps.push('factoryflow');
+    if (String(acessoPaintLab || '').trim()) apps.push('paintlab');
+    if (String(acessoCqVision || '').trim()) apps.push('cqvision');
 
     // Compatibilidade: se for admin/gerente/pcp/operador mas o campo de acesso estiver vazio,
     // ainda libera o FactoryFlow para não bloquear usuários antigos da empresa.
-    const roleNorm = String(user.role || '').toLowerCase().trim();
+    const roleNorm = String(user.role || user.perfil || '').toLowerCase().trim();
+
     if (!apps.includes('factoryflow') && [
-      'admin', 'administrador', 'diretoria', 'pcp', 'pcp_lib', 'gerente', 'manager',
-      'sector', 'setor', 'operador', 'driver', 'motorista', 'tv', 'viewer', 'visualizador'
+      'admin',
+      'administrador',
+      'diretoria',
+      'pcp',
+      'pcp_lib',
+      'gerente',
+      'manager',
+      'sector',
+      'setor',
+      'operador',
+      'driver',
+      'motorista',
+      'tv',
+      'viewer',
+      'visualizador'
     ].includes(roleNorm)) {
       apps.push('factoryflow');
     }
 
     const payload = {
       id: user.id,
-      usuario: user.usuario,
-      login: user.usuario,
-      username: user.usuario,
-      nome: user.nome,
-      name: user.nome,
-      role: user.role,
-      acesso_factoryflow: user.acesso_factoryflow || '',
-      acesso_paintlab: user.acesso_paintlab || '',
-      acesso_cqvision: user.acesso_cqvision || '',
+      usuario: userLogin,
+      login: userLogin,
+      username: userLogin,
+      nome: userName,
+      name: userName,
+      role: user.role || user.perfil || 'viewer',
+      acesso_factoryflow: acessoFactoryFlow,
+      acesso_paintlab: acessoPaintLab,
+      acesso_cqvision: acessoCqVision,
       apps
     };
 
     const token = signFactoryFlowJwt(payload);
+
+    console.log('✅ Login OK:', userLogin, '| apps:', apps.join(',') || '-', '| role:', payload.role);
 
     return res.json({
       ok: true,
