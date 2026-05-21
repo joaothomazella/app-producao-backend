@@ -197,6 +197,249 @@ function normalizeShiftSetor(setor) {
   return map[s] || s;
 }
 
+
+
+// =========================
+// RELATÓRIO DE TEMPOS - HELPERS
+// =========================
+
+function rtSafeParseJson(value, fallback = null) {
+  if (value == null || value === '') return fallback;
+  if (Array.isArray(value) || typeof value === 'object') return value;
+  const raw = String(value || '').trim();
+  if (!raw) return fallback;
+  try { return JSON.parse(raw); } catch (_) { return fallback; }
+}
+
+function rtArray(value) {
+  const parsed = rtSafeParseJson(value, []);
+  if (Array.isArray(parsed)) return parsed;
+  if (parsed && typeof parsed === 'object') return Object.values(parsed).filter(Boolean);
+  return [];
+}
+
+function rtNormalizeText(value) {
+  return String(value || '')
+    .toLowerCase()
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-z0-9_\-\s]/g, '')
+    .replace(/\s+/g, '_');
+}
+
+function rtDisplaySector(value) {
+  const s = String(value || '').trim();
+  if (!s) return 'sem_setor';
+  const map = {
+    pcp: 'PCP',
+    pcp_liberacao: 'PCP (Liberação)',
+    pesagem: 'Pesagem',
+    producao: 'Produção',
+    moagem: 'Moagem',
+    laboratorio: 'Laboratório',
+    laboratorio_revisao: 'Laboratório (Revisão)',
+    laboratorio_amostras: 'Laboratório (Amostras)',
+    coloracao: 'Coloração',
+    coloracao_revisao: 'Coloração (Revisão)',
+    coloracao_amostras: 'Coloração (Amostras)',
+    envase: 'Envase',
+    envase_produzir: 'Envase - Produzir',
+    envase_enlatamento: 'Envase - Enlatamento',
+    pronto: 'Pronto para Entrega',
+    pronto_para_entrega: 'Pronto para Entrega',
+    entregue: 'Entregue'
+  };
+  return map[rtNormalizeText(s)] || s;
+}
+
+function rtToMs(value) {
+  if (value == null || value === '') return null;
+  if (typeof value === 'number' && Number.isFinite(value)) return value < 10000000000 ? Math.round(value * 1000) : Math.round(value);
+  if (value instanceof Date) {
+    const t = value.getTime();
+    return Number.isFinite(t) ? t : null;
+  }
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    return n < 10000000000 ? Math.round(n * 1000) : Math.round(n);
+  }
+  const t = new Date(raw).getTime();
+  return Number.isFinite(t) ? t : null;
+}
+
+function rtDurationMs(value) {
+  const n = Number(value || 0);
+  return Number.isFinite(n) && n > 0 ? Math.round(n) : 0;
+}
+
+function rtPickFirstMs(...values) {
+  for (const value of values) {
+    const ms = rtToMs(value);
+    if (ms) return ms;
+  }
+  return null;
+}
+
+function rtGetSessionSector(session, fallbackSector = '') {
+  return String(session?.sector || session?.setor || session?.sectorKey || session?.setorAtual || session?.setor_atual || fallbackSector || '').trim();
+}
+
+function rtGetSessionType(session) {
+  const raw = rtNormalizeText(session?.type || session?.tipo || session?.status || session?.action || session?.acao || session?.mode || '');
+  if (raw.includes('pause') || raw.includes('pausa') || raw.includes('paused')) return 'pause';
+  if (raw.includes('work') || raw.includes('trabalho') || raw.includes('trabalhando') || raw.includes('resume') || raw.includes('retom')) return 'work';
+  return raw || 'work';
+}
+
+function rtGetSessionRange(session) {
+  const start = rtPickFirstMs(session?.startedAt, session?.startAt, session?.start, session?.inicio, session?.iniciadoEm, session?.createdAt, session?.created_at, session?.timestamp, session?.time, session?.data);
+  const end = rtPickFirstMs(session?.endedAt, session?.endAt, session?.end, session?.fim, session?.finalizadoEm, session?.stoppedAt, session?.updatedAt, session?.updated_at);
+  const duration = rtDurationMs(session?.durationMs ?? session?.duration_ms ?? session?.elapsedMs ?? session?.elapsed_ms ?? session?.tempoMs ?? session?.tempo_ms);
+  return { start, end, duration };
+}
+
+function rtSumWorkSessionsBySector(workSessions, sector, enteredAt, leftAt) {
+  const target = rtNormalizeText(sector);
+  const startLimit = Number(enteredAt || 0);
+  const endLimit = Number(leftAt || Date.now());
+  const acc = { workedMs: 0, pausedMs: 0 };
+  for (const session of rtArray(workSessions)) {
+    if (!session || typeof session !== 'object') continue;
+    const sessionSector = rtGetSessionSector(session, sector);
+    if (target && rtNormalizeText(sessionSector) && rtNormalizeText(sessionSector) !== target) continue;
+    const { start, end, duration } = rtGetSessionRange(session);
+    let ms = duration;
+    if (!ms && start) {
+      const safeStart = Math.max(start, startLimit || start);
+      const safeEnd = Math.min(end || Date.now(), endLimit || end || Date.now());
+      ms = Math.max(0, safeEnd - safeStart);
+    }
+    if (!ms) continue;
+    const type = rtGetSessionType(session);
+    if (type === 'pause') acc.pausedMs += ms;
+    else acc.workedMs += ms;
+  }
+  return acc;
+}
+
+function rtExtractSectorFromHistoryEvent(event) {
+  const direct = String(event?.sector || event?.setor || event?.toSector || event?.to_sector || event?.novoSetor || event?.setorDestino || event?.destinationSector || '').trim();
+  if (direct) return direct;
+  const text = String(event?.title || event?.message || event?.description || event?.descricao || event?.acao || '').trim();
+  const lower = rtNormalizeText(text);
+  const known = [
+    ['laboratorio_revisao', ['laboratorio_revisao', 'laboratorio revisao']],
+    ['laboratorio_amostras', ['laboratorio_amostras', 'laboratorio amostras', 'laboratorio_amostra']],
+    ['coloracao_revisao', ['coloracao_revisao', 'coloracao revisao']],
+    ['coloracao_amostras', ['coloracao_amostras', 'coloracao amostras', 'coloracao_amostra']],
+    ['envase_enlatamento', ['envase_enlatamento', 'enlatamento']],
+    ['envase_produzir', ['envase_produzir']],
+    ['pcp_liberacao', ['pcp_liberacao', 'pcp liberacao']],
+    ['pesagem', ['pesagem']],
+    ['producao', ['producao', 'produção']],
+    ['moagem', ['moagem']],
+    ['laboratorio', ['laboratorio', 'lab']],
+    ['coloracao', ['coloracao', 'coloração']],
+    ['envase', ['envase']],
+    ['pcp', ['pcp']],
+    ['pronto_para_entrega', ['pronto_para_entrega', 'pronto entrega']]
+  ];
+  for (const [sector, needles] of known) {
+    if (needles.some(n => lower.includes(rtNormalizeText(n)))) return sector;
+  }
+  return '';
+}
+
+function rtGetHistoryEventTime(event) {
+  return rtPickFirstMs(event?.timestamp, event?.time, event?.date, event?.data, event?.createdAt, event?.created_at, event?.at, event?.quando);
+}
+
+function rtCalculateMetricsFromFallback(row) {
+  const now = Date.now();
+  const history = rtArray(row.ff_history)
+    .map(event => ({ event, sector: rtExtractSectorFromHistoryEvent(event), at: rtGetHistoryEventTime(event) }))
+    .filter(item => item.sector && item.at)
+    .sort((a, b) => a.at - b.at);
+  const metrics = [];
+  for (let i = 0; i < history.length; i++) {
+    const current = history[i];
+    const next = history[i + 1];
+    const enteredAt = current.at;
+    const leftAt = next?.at || null;
+    const totalMs = Math.max(0, (leftAt || now) - enteredAt);
+    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, leftAt || now);
+    const workedMs = sessionSum.workedMs;
+    const pausedMs = sessionSum.pausedMs;
+    const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
+    const efficiency = totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0;
+    metrics.push({ sector: current.sector, enteredAt, leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status: leftAt ? 'Finalizado' : 'Em andamento' });
+  }
+  if (!metrics.length) {
+    const currentSector = row.setor_atual || row.ff_lotStatus || 'sem_setor';
+    const enteredAt = rtPickFirstMs(row.ff_sectorEnteredAt, row.updated_at, row.data_criacao) || now;
+    const totalMs = Math.max(0, now - enteredAt);
+    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, currentSector, enteredAt, now);
+    const workedMs = sessionSum.workedMs;
+    const pausedMs = sessionSum.pausedMs;
+    const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
+    const efficiency = totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0;
+    metrics.push({ sector: currentSector, enteredAt, leftAt: null, totalMs, workedMs, pausedMs, idleMs, efficiency, status: 'Em andamento' });
+  }
+  return metrics;
+}
+
+function rtNormalizeMetric(metric, row) {
+  const now = Date.now();
+  const sector = String(metric?.sector || metric?.setor || metric?.sectorKey || row?.setor_atual || 'sem_setor').trim();
+  const enteredAt = rtPickFirstMs(metric?.enteredAt, metric?.entered_at, metric?.entrada, metric?.start, metric?.inicio, row?.ff_sectorEnteredAt, row?.data_criacao, row?.updated_at) || now;
+  const rawLeftAt = rtPickFirstMs(metric?.leftAt, metric?.left_at, metric?.saida, metric?.end, metric?.fim);
+  const isCurrentSector = rtNormalizeText(sector) === rtNormalizeText(row?.setor_atual || '');
+  const isClosedByMetric = !!rawLeftAt || String(metric?.status || '').toLowerCase().includes('final');
+  const leftAt = rawLeftAt || (isCurrentSector && !isClosedByMetric ? null : rtPickFirstMs(metric?.updatedAt, metric?.updated_at));
+  const effectiveLeftAt = leftAt || now;
+  const totalMs = rtDurationMs(metric?.totalMs ?? metric?.total_ms ?? metric?.tempoTotalMs) || Math.max(0, effectiveLeftAt - enteredAt);
+  const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, sector, enteredAt, effectiveLeftAt);
+  const workedMs = rtDurationMs(metric?.workedMs ?? metric?.worked_ms ?? metric?.tempoTrabalhadoMs) || sessionSum.workedMs;
+  const pausedMs = rtDurationMs(metric?.pausedMs ?? metric?.paused_ms ?? metric?.tempoPausadoMs) || sessionSum.pausedMs;
+  const idleMs = Math.max(0, rtDurationMs(metric?.idleMs ?? metric?.idle_ms ?? metric?.tempoOciosoMs) || (totalMs - workedMs - pausedMs));
+  const efficiencyRaw = metric?.efficiency ?? metric?.eficiencia ?? metric?.efficiencyPct ?? metric?.eficienciaPct;
+  const efficiency = Number.isFinite(Number(efficiencyRaw)) ? Math.round(Number(efficiencyRaw)) : (totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0);
+  return { sector, enteredAt, leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status: leftAt ? 'Finalizado' : 'Em andamento' };
+}
+
+function rtBuildTempoRowsFromLot(row, setorFiltro = '') {
+  const parsedMetrics = rtArray(row.ff_sectorMetrics);
+  const baseMetrics = parsedMetrics.length ? parsedMetrics.map(metric => rtNormalizeMetric(metric, row)) : rtCalculateMetricsFromFallback(row);
+  const filterNorm = rtNormalizeText(setorFiltro);
+  return baseMetrics
+    .filter(metric => !filterNorm || rtNormalizeText(metric.sector) === filterNorm || rtNormalizeText(rtDisplaySector(metric.sector)) === filterNorm)
+    .map(metric => ({
+      op: row.op || '',
+      numero_pedido: row.numero_pedido || '',
+      produto_codigo: row.produto_codigo || '',
+      produto_nome: row.produto_nome || '',
+      cliente_nome: row.cliente_nome || '',
+      quantidade: Number(row.quantidade || 0),
+      linha_produto: row.linha_produto || '',
+      setor: metric.sector || 'sem_setor',
+      setor_nome: rtDisplaySector(metric.sector || 'sem_setor'),
+      enteredAt: metric.enteredAt || null,
+      leftAt: metric.leftAt || null,
+      totalMs: Math.max(0, Number(metric.totalMs || 0)),
+      workedMs: Math.max(0, Number(metric.workedMs || 0)),
+      pausedMs: Math.max(0, Number(metric.pausedMs || 0)),
+      idleMs: Math.max(0, Number(metric.idleMs || 0)),
+      efficiency: Math.max(0, Math.min(100, Number(metric.efficiency || 0))),
+      status: metric.status || (metric.leftAt ? 'Finalizado' : 'Em andamento'),
+      status_atual_lote: row.status || '',
+      setor_atual_lote: row.setor_atual || '',
+      id_lote: row.id || null
+    }));
+}
+
 async function getProductionLoteByOp(op) {
   const hasProducaoLotes = await tableExists('producao_lotes');
   if (!hasProducaoLotes) return null;
@@ -447,6 +690,7 @@ app.get('/', (req, res) => {
       'GET /api/ops/:op',
       'GET /api/producao',
       'GET /api/producao/ativos',
+      'GET /api/producao/relatorio-tempos',
       'GET /api/producao/:id',
       'POST /api/producao/manual',
       'POST /api/lotes',
@@ -2534,6 +2778,142 @@ app.get('/api/producao/metricas', async (req, res) => {
     sendError(res, 500, 'Erro ao calcular mÃ©tricas de produÃ§Ã£o', err.message);
   }
 });
+
+
+// =========================
+// PRODUÇÃO - RELATÓRIO DE TEMPOS
+// =========================
+// Usada exclusivamente pela aba "Relatório de Tempos" do frontend.
+// Não altera Kanban, não mexe no fluxo de avanço e carrega somente sob demanda.
+// IMPORTANTE: manter antes de /api/producao/:id.
+app.get('/api/producao/relatorio-tempos', async (req, res) => {
+  try {
+    const hasProducaoLotes = await tableExists('producao_lotes');
+    if (!hasProducaoLotes) {
+      return sendError(res, 404, 'Tabela producao_lotes não encontrada');
+    }
+
+    const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 500), 1), 2000);
+    const offset = toPositiveInt(req.query.offset, 0);
+
+    const codigoRaw = String(req.query.codigos || req.query.codigo || '').trim();
+    const codigos = codigoRaw.split(/[;,\n\s]+/).map(v => v.trim()).filter(Boolean);
+    const produto = String(req.query.produto || '').trim();
+    const op = String(req.query.op || req.query.lote || '').trim();
+    const pedido = String(req.query.pedido || req.query.numero_pedido || '').trim();
+    const cliente = String(req.query.cliente || '').trim();
+    const setor = String(req.query.setor || '').trim();
+    const inicio = String(req.query.inicio || '').slice(0, 10);
+    const fim = String(req.query.fim || '').slice(0, 10);
+
+    const conditions = [];
+    const params = [];
+
+    if (codigos.length) {
+      conditions.push(`(${codigos.map(() => 'TRIM(produto_codigo) LIKE ?').join(' OR ')})`);
+      for (const codigo of codigos) params.push(`${codigo}%`);
+    }
+    if (produto) { conditions.push('produto_nome LIKE ?'); params.push(`%${produto}%`); }
+    if (op) { conditions.push('TRIM(op) = TRIM(?)'); params.push(op); }
+    if (pedido) { conditions.push('TRIM(numero_pedido) = TRIM(?)'); params.push(pedido); }
+    if (cliente) { conditions.push('cliente_nome LIKE ?'); params.push(`%${cliente}%`); }
+    if (setor) {
+      conditions.push('(setor_atual LIKE ? OR ff_sectorMetrics LIKE ? OR ff_history LIKE ?)');
+      params.push(`%${setor}%`, `%${setor}%`, `%${setor}%`);
+    }
+    if (inicio) { conditions.push('DATE(COALESCE(updated_at, data_criacao)) >= ?'); params.push(inicio); }
+    if (fim) { conditions.push('DATE(COALESCE(updated_at, data_criacao)) <= ?'); params.push(fim); }
+
+    const hasAnyUserFilter = Boolean(codigos.length || produto || op || pedido || cliente || setor || inicio || fim);
+    if (!hasAnyUserFilter) {
+      conditions.push('COALESCE(updated_at, data_criacao) >= DATE_SUB(NOW(), INTERVAL 30 DAY)');
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+    const [lotes] = await dbPool.query(
+      `
+        SELECT
+          id,
+          op,
+          numero_pedido,
+          produto_codigo,
+          produto_nome,
+          cliente_nome,
+          quantidade,
+          linha_produto,
+          status,
+          setor_atual,
+          ff_lotStatus,
+          ff_sectorEnteredAt,
+          ff_workSessions,
+          ff_history,
+          ff_sectorMetrics,
+          data_criacao,
+          updated_at
+        FROM producao_lotes
+        ${where}
+        ORDER BY COALESCE(updated_at, data_criacao) DESC, id DESC
+        LIMIT ? OFFSET ?
+      `,
+      [...params, limit, offset]
+    );
+
+    let data = [];
+    for (const lote of lotes) data.push(...rtBuildTempoRowsFromLot(lote, setor));
+
+    if (inicio || fim) {
+      const inicioMs = inicio ? rtToMs(`${inicio}T00:00:00-03:00`) : null;
+      const fimMs = fim ? rtToMs(`${fim}T23:59:59-03:00`) : null;
+      data = data.filter(row => {
+        const ref = Number(row.enteredAt || 0);
+        if (inicioMs && ref && ref < inicioMs) return false;
+        if (fimMs && ref && ref > fimMs) return false;
+        return true;
+      });
+    }
+
+    const resumo = data.reduce((acc, row) => {
+      acc.totalMs += Number(row.totalMs || 0);
+      acc.workedMs += Number(row.workedMs || 0);
+      acc.pausedMs += Number(row.pausedMs || 0);
+      acc.idleMs += Number(row.idleMs || 0);
+      return acc;
+    }, { totalMs: 0, workedMs: 0, pausedMs: 0, idleMs: 0 });
+    const efficiencyAvg = data.length ? Math.round(data.reduce((acc, row) => acc + Number(row.efficiency || 0), 0) / data.length) : 0;
+
+    return res.json({
+      ok: true,
+      total: data.length,
+      limit,
+      offset,
+      filtros: {
+        codigo: req.query.codigo || null,
+        codigos: req.query.codigos || null,
+        produto: produto || null,
+        op: op || null,
+        pedido: pedido || null,
+        cliente: cliente || null,
+        setor: setor || null,
+        inicio: inicio || null,
+        fim: fim || null,
+        default_ultimos_30_dias: !hasAnyUserFilter
+      },
+      resumo: {
+        totalLinhas: data.length,
+        totalMs: resumo.totalMs,
+        workedMs: resumo.workedMs,
+        pausedMs: resumo.pausedMs,
+        idleMs: resumo.idleMs,
+        efficiencyAvg
+      },
+      data
+    });
+  } catch (err) {
+    console.error('GET /api/producao/relatorio-tempos erro:', err.message);
+    return sendError(res, 500, 'Erro ao gerar relatório de tempos', err.message);
+  }
+});
+
 
 app.get('/api/producao', async (req, res) => {
   try {
@@ -5210,6 +5590,7 @@ app.use((req, res) => {
       console.log('   GET  /api/ops');
       console.log('   GET  /api/ops/:op');
       console.log('   GET  /api/producao');
+      console.log('   GET  /api/producao/relatorio-tempos');
       console.log('   GET  /api/producao/:id');
       console.log('   POST /api/producao/manual');
       console.log('   POST /api/lotes');
