@@ -86,6 +86,31 @@ function resolveQuantidadeKg(...values) {
 }
 
 
+function normalizeProductionTipo(value, productName = '', productCode = '') {
+  const raw = String(value || '')
+    .toLowerCase()
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  const name = String(productName || '')
+    .toLowerCase()
+    .trim()
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '');
+
+  const code = String(productCode || '').toLowerCase().trim();
+
+  if (raw === 'base' || raw.includes('base') || name.includes('base')) return 'base';
+  if (raw === 'amostra' || raw.includes('amostra') || name.includes('amostra')) return 'amostra';
+  if (raw === 'diluente' || raw.includes('diluente') || raw.includes('solvente') || name.includes('diluente') || name.includes('solvente')) return 'diluente';
+  if (raw === 'endurecedor' || raw.includes('endurecedor') || name.includes('endurecedor') || code.startsWith('035')) return 'endurecedor';
+
+  return 'tinta';
+}
+
+
+
 async function tableExists(tableName) {
   const [rows] = await dbPool.query(
     `
@@ -2323,8 +2348,8 @@ async function criarLoteManual(req, res) {
     const clienteCidade = String(body.cliente_cidade || body.cidade || '').trim();
     const clienteCep = String(body.cliente_cep || body.cep || '').trim();
     const clienteEstado = String(body.cliente_estado || body.estado || '').trim();
-    const tipoLote = String(body.tipo_lote || body.tipo || 'manual').trim();
-    const linhaProduto = String(body.linha_produto || body.linha || body.product_type || '').trim();
+    const tipoLote = normalizeProductionTipo(body.tipo_lote || body.tipo || body.productType || body.product_type || body.linha_produto || body.linha, produtoNome, produtoCodigo);
+    const linhaProduto = String(body.linha_produto || body.linha || body.product_type || tipoLote).trim();
     const prioridade = String(body.prioridade || body.urgencia || 'normal').trim();
     const setorAtual = String(body.setor_atual || body.setor || 'moagem').trim();
     const status = String(body.status || 'aguardando').trim();
