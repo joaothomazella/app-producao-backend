@@ -288,10 +288,14 @@ function rtGetSessionSector(session, fallbackSector = '') {
 }
 
 function rtGetSessionType(session) {
+  // Compatibilidade com o front novo: pausa é uma sessão própria com pauseReason.
+  if (session?.pauseReason && String(session.pauseReason).trim()) return 'pause';
+  if (session?.motivoPausa && String(session.motivoPausa).trim()) return 'pause';
+
   const raw = rtNormalizeText(session?.type || session?.tipo || session?.status || session?.action || session?.acao || session?.mode || '');
   if (raw.includes('pause') || raw.includes('pausa') || raw.includes('paused')) return 'pause';
   if (raw.includes('work') || raw.includes('trabalho') || raw.includes('trabalhando') || raw.includes('resume') || raw.includes('retom')) return 'work';
-  return raw || 'work';
+  return 'work';
 }
 
 function rtGetSessionRange(session) {
