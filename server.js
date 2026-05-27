@@ -2502,28 +2502,55 @@ app.get('/api/producao/ativos', async (req, res) => {
     const [rows] = await dbPool.query(
       `
         SELECT
-          id,
-          op,
-          numero_pedido,
-          produto_codigo,
-          produto_nome,
-          cliente_nome,
-          quantidade,
-          setor_atual,
-          status,
-          linha_produto,
-          ff_lotStatus,
-          ff_sectorEnteredAt,
-          ff_workSessions,
-          ff_history,
-          ff_sectorMetrics,
-          data_criacao,
-          updated_at
-        FROM producao_lotes
+          pl.id,
+          pl.op,
+          pl.numero_pedido,
+          pl.cliente_codigo,
+          pl.cliente_nome,
+          pl.produto_codigo,
+          pl.produto_nome,
+          COALESCE(NULLIF(pl.quantidade, 0), erp.pits_peso, erp.pits_qtde, 0) AS quantidade,
+          erp.pits_qtde,
+          erp.pits_peso,
+          erp.pits_previsao,
+          erp.pits_previsao AS deliveryDate,
+          erp.pits_previsao AS previsao_entrega,
+          COALESCE(NULLIF(TRIM(pl.cliente_endereco), ''), c.cli_endereco, '') AS cliente_endereco,
+          COALESCE(NULLIF(TRIM(pl.cliente_bairro), ''), c.cli_bairro, '') AS cliente_bairro,
+          COALESCE(NULLIF(TRIM(pl.cliente_cidade), ''), c.cli_cidade, '') AS cliente_cidade,
+          COALESCE(NULLIF(TRIM(pl.cliente_cep), ''), c.cli_cep, '') AS cliente_cep,
+          COALESCE(NULLIF(TRIM(pl.cliente_estado), ''), c.cli_estado, '') AS cliente_estado,
+          pl.tipo_lote,
+          pl.prioridade,
+          pl.setor_atual,
+          pl.status,
+          pl.linha_produto,
+          pl.ff_lotStatus,
+          pl.ff_sectorEnteredAt,
+          pl.ff_workSessions,
+          pl.ff_expedientePausedStatus,
+          pl.ff_history,
+          pl.ff_sectorMetrics,
+          pl.data_criacao,
+          pl.updated_at
+        FROM producao_lotes pl
+        LEFT JOIN (
+          SELECT
+            TRIM(pits_op) AS pits_op,
+            MAX(pits_previsao) AS pits_previsao,
+            MAX(COALESCE(pits_peso, 0)) AS pits_peso,
+            MAX(COALESCE(pits_qtde, 0)) AS pits_qtde
+          FROM cli_pedidos_itens
+          WHERE pits_op IS NOT NULL AND TRIM(pits_op) <> ''
+          GROUP BY TRIM(pits_op)
+        ) erp
+          ON TRIM(erp.pits_op) = TRIM(pl.op)
+        LEFT JOIN cli_clientes c
+          ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(pl.cliente_codigo) AS UNSIGNED)
         WHERE
-          LOWER(COALESCE(status, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
-          AND LOWER(COALESCE(setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
-        ORDER BY id DESC
+          LOWER(COALESCE(pl.status, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
+          AND LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
+        ORDER BY pl.id DESC
         LIMIT ?
       `,
       [limit]
