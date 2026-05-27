@@ -72,6 +72,20 @@ function toPositiveInt(value, fallback) {
   return Math.floor(n);
 }
 
+function firstPositiveNumber(...values) {
+  for (const value of values) {
+    if (value === undefined || value === null || value === '') continue;
+    const n = Number(value);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return 0;
+}
+
+function resolveQuantidadeKg(...values) {
+  return firstPositiveNumber(...values);
+}
+
+
 async function tableExists(tableName) {
   const [rows] = await dbPool.query(
     `
@@ -905,7 +919,7 @@ async function consultarPedidoOuOpWhatsapp(texto) {
       `Pedido: ${pedidoItem.pits_numero || '-'}`,
       `Cliente: ${pedidoItem.nome_cliente || '-'}`,
       `Produto: ${pedidoItem.pits_nome_produto || '-'}`,
-      `Quantidade: ${pedidoItem.pits_qtde || '-'}`,
+      `Quantidade: ${pedidoItem.pits_peso || pedidoItem.pits_qtde || '-'} Kg`,
       `Previsão: ${formatarDataCurta(pedidoItem.pits_previsao)}`,
     ].join('\n');
   }
@@ -2086,11 +2100,22 @@ app.get('/api/pedidos/:numero', async (req, res) => {
       total_peso: rows.reduce((acc, item) => acc + Number(item.pits_peso || 0), 0),
     };
 
+    const itens = rows.map((row) => ({
+      ...row,
+      // No ERP, pits_qtde costuma ser quantidade de embalagem/unidade.
+      // Para o FactoryFlow, a quantidade operacional deve ser o peso real em Kg.
+      quantidade: resolveQuantidadeKg(row.pits_peso, row.pits_qtde),
+      quantidade_kg: resolveQuantidadeKg(row.pits_peso, row.pits_qtde),
+      peso: resolveQuantidadeKg(row.pits_peso),
+      peso_kg: resolveQuantidadeKg(row.pits_peso),
+      quantidade_embalagem: Number(row.pits_qtde || 0)
+    }));
+
     res.json({
       ok: true,
       pedido: header,
       data: header,
-      itens: rows,
+      itens,
     });
   } catch (err) {
     console.error('GET /api/pedidos/:numero erro:', err.message);
@@ -2235,6 +2260,15 @@ app.get('/api/ops/:op', async (req, res) => {
       return sendError(res, 404, 'OP não encontrada');
     }
 
+    const itens = rows.map((row) => ({
+      ...row,
+      quantidade: resolveQuantidadeKg(row.pits_peso, row.pits_qtde),
+      quantidade_kg: resolveQuantidadeKg(row.pits_peso, row.pits_qtde),
+      peso: resolveQuantidadeKg(row.pits_peso),
+      peso_kg: resolveQuantidadeKg(row.pits_peso),
+      quantidade_embalagem: Number(row.pits_qtde || 0)
+    }));
+
     res.json({
       ok: true,
       resumo: {
@@ -2247,7 +2281,7 @@ app.get('/api/ops/:op', async (req, res) => {
         total_quantidade: rows.reduce((acc, item) => acc + Number(item.pits_qtde || 0), 0),
         total_peso: rows.reduce((acc, item) => acc + Number(item.pits_peso || 0), 0),
       },
-      itens: rows,
+      itens,
     });
   } catch (err) {
     console.error('GET /api/ops/:op erro:', err.message);
@@ -2294,7 +2328,16 @@ async function criarLoteManual(req, res) {
     const prioridade = String(body.prioridade || body.urgencia || 'normal').trim();
     const setorAtual = String(body.setor_atual || body.setor || 'moagem').trim();
     const status = String(body.status || 'aguardando').trim();
-    const quantidade = Number(body.quantidade ?? body.pits_qtde ?? body.qtd ?? 0) || 0;
+    const quantidade = resolveQuantidadeKg(
+      body.peso,
+      body.pits_peso,
+      body.peso_kg,
+      body.quantidade_kg,
+      body.kg,
+      body.quantidade,
+      body.pits_qtde,
+      body.qtd
+    );
 
     if (!op) return sendError(res, 400, 'Informe a OP/lote');
     if (!produtoNome && !produtoCodigo) return sendError(res, 400, 'Informe o produto');
