@@ -333,56 +333,273 @@ function rtPickFirstMs(...values) {
   return null;
 }
 
+
 function rtGetSessionSector(session, fallbackSector = '') {
-  return String(session?.sector || session?.setor || session?.sectorKey || session?.setorAtual || session?.setor_atual || fallbackSector || '').trim();
+  return String(
+    session?.sector ||
+    session?.setor ||
+    session?.sectorKey ||
+    session?.setorAtual ||
+    session?.setor_atual ||
+    session?.currentSector ||
+    session?.current_sector ||
+    fallbackSector ||
+    ''
+  ).trim();
 }
 
 function rtGetSessionType(session) {
-  // Compatibilidade com o front novo: pausa é uma sessão própria com pauseReason.
+  // Compatibilidade com vários formatos usados pelo front:
+  // pauseReason/motivoPausa, type/status/action e também sessões com pausedMs.
   if (session?.pauseReason && String(session.pauseReason).trim()) return 'pause';
   if (session?.motivoPausa && String(session.motivoPausa).trim()) return 'pause';
+  if (rtDurationMs(session?.pausedMs ?? session?.paused_ms ?? session?.tempoPausadoMs ?? session?.tempo_pausado_ms) > 0) return 'mixed';
 
-  const raw = rtNormalizeText(session?.type || session?.tipo || session?.status || session?.action || session?.acao || session?.mode || '');
-  if (raw.includes('pause') || raw.includes('pausa') || raw.includes('paused')) return 'pause';
+  const raw = rtNormalizeText(
+    session?.type ||
+    session?.tipo ||
+    session?.status ||
+    session?.action ||
+    session?.acao ||
+    session?.mode ||
+    session?.event ||
+    session?.evento ||
+    ''
+  );
+
+  if (raw.includes('pause') || raw.includes('pausa') || raw.includes('paused') || raw.includes('pausado')) return 'pause';
   if (raw.includes('work') || raw.includes('trabalho') || raw.includes('trabalhando') || raw.includes('resume') || raw.includes('retom')) return 'work';
   return 'work';
 }
 
 function rtGetSessionRange(session) {
-  const start = rtPickFirstMs(session?.startedAt, session?.startAt, session?.start, session?.inicio, session?.iniciadoEm, session?.createdAt, session?.created_at, session?.timestamp, session?.time, session?.data);
-  const end = rtPickFirstMs(session?.endedAt, session?.endAt, session?.end, session?.fim, session?.finalizadoEm, session?.stoppedAt, session?.updatedAt, session?.updated_at);
-  const duration = rtDurationMs(session?.durationMs ?? session?.duration_ms ?? session?.elapsedMs ?? session?.elapsed_ms ?? session?.tempoMs ?? session?.tempo_ms);
-  return { start, end, duration };
+  const start = rtPickFirstMs(
+    session?.startedAt,
+    session?.startAt,
+    session?.start,
+    session?.inicio,
+    session?.iniciadoEm,
+    session?.iniciado_em,
+    session?.createdAt,
+    session?.created_at,
+    session?.timestamp,
+    session?.time,
+    session?.data,
+    session?.pauseStart,
+    session?.pausaInicio,
+    session?.pausedAt,
+    session?.paused_at
+  );
+
+  const end = rtPickFirstMs(
+    session?.endedAt,
+    session?.endAt,
+    session?.end,
+    session?.fim,
+    session?.finalizadoEm,
+    session?.finalizado_em,
+    session?.stoppedAt,
+    session?.updatedAt,
+    session?.updated_at,
+    session?.pauseEnd,
+    session?.pausaFim,
+    session?.resumedAt,
+    session?.resumed_at,
+    session?.retomadoEm,
+    session?.retomado_em
+  );
+
+  const duration = rtDurationMs(
+    session?.durationMs ??
+    session?.duration_ms ??
+    session?.elapsedMs ??
+    session?.elapsed_ms ??
+    session?.tempoMs ??
+    session?.tempo_ms ??
+    session?.totalMs ??
+    session?.total_ms
+  );
+
+  const workedDuration = rtDurationMs(
+    session?.workedMs ??
+    session?.worked_ms ??
+    session?.tempoTrabalhadoMs ??
+    session?.tempo_trabalhado_ms
+  );
+
+  const pausedDuration = rtDurationMs(
+    session?.pausedMs ??
+    session?.paused_ms ??
+    session?.tempoPausadoMs ??
+    session?.tempo_pausado_ms
+  );
+
+  return { start, end, duration, workedDuration, pausedDuration };
+}
+
+function rtOverlapMs(start, end, limitStart, limitEnd) {
+  const safeStart = Math.max(Number(start || 0), Number(limitStart || start || 0));
+  const safeEnd = Math.min(Number(end || Date.now()), Number(limitEnd || end || Date.now()));
+  return Math.max(0, safeEnd - safeStart);
+}
+
+function rtSessionMatchesSector(session, targetSector, fallbackSector = '') {
+  const target = rtNormalizeText(targetSector);
+  if (!target) return true;
+
+  const sessionSector = rtNormalizeText(rtGetSessionSector(session, fallbackSector));
+  if (!sessionSector) return true;
+  if (sessionSector === target) return true;
+
+  // Compatibilidade entre setores agrupados/sinônimos.
+  const groups = [
+    ['laboratorio', 'laboratorio_revisao', 'laboratorio_amostras', 'lab'],
+    ['coloracao', 'coloracao_revisao', 'coloracao_amostras'],
+    ['envase', 'envase_produzir', 'envase_enlatamento']
+  ];
+
+  return groups.some(group => group.includes(target) && group.includes(sessionSector));
+}
+
+function rtMergeIntervals(intervals) {
+  const clean = (intervals || [])
+    .map(i => ({ start: Number(i.start || 0), end: Number(i.end || 0) }))
+    .filter(i => i.start > 0 && i.end > i.start)
+    .sort((a, b) => a.start - b.start);
+
+  const merged = [];
+  for (const item of clean) {
+    const last = merged[merged.length - 1];
+    if (!last || item.start > last.end) merged.push({ ...item });
+    else last.end = Math.max(last.end, item.end);
+  }
+  return merged;
+}
+
+function rtIntervalsTotalMs(intervals) {
+  return rtMergeIntervals(intervals).reduce((sum, i) => sum + Math.max(0, i.end - i.start), 0);
+}
+
+function rtSubtractIntervals(baseIntervals, subtractIntervals) {
+  let result = rtMergeIntervals(baseIntervals);
+  const subtracts = rtMergeIntervals(subtractIntervals);
+
+  for (const sub of subtracts) {
+    const next = [];
+    for (const base of result) {
+      if (sub.end <= base.start || sub.start >= base.end) {
+        next.push(base);
+        continue;
+      }
+      if (sub.start > base.start) next.push({ start: base.start, end: Math.min(sub.start, base.end) });
+      if (sub.end < base.end) next.push({ start: Math.max(sub.end, base.start), end: base.end });
+    }
+    result = next;
+  }
+
+  return rtMergeIntervals(result);
+}
+
+function rtSessionExplicitPauseRange(session) {
+  const start = rtPickFirstMs(
+    session?.pauseStart,
+    session?.pausaInicio,
+    session?.pausadoEm,
+    session?.pausedAt,
+    session?.paused_at,
+    session?.startPause,
+    session?.start_pause,
+    session?.start,
+    session?.inicio,
+    session?.startedAt,
+    session?.started_at
+  );
+
+  const end = rtPickFirstMs(
+    session?.pauseEnd,
+    session?.pausaFim,
+    session?.retomadoEm,
+    session?.retomado_em,
+    session?.resumedAt,
+    session?.resumed_at,
+    session?.endPause,
+    session?.end_pause,
+    session?.end,
+    session?.fim,
+    session?.endedAt,
+    session?.ended_at
+  );
+
+  return { start, end };
 }
 
 function rtSumWorkSessionsBySector(workSessions, sector, enteredAt, leftAt) {
-  const target = rtNormalizeText(sector);
   const startLimit = Number(enteredAt || 0);
   const endLimit = Number(leftAt || Date.now());
-  const acc = { workedMs: 0, pausedMs: 0 };
+  const now = Date.now();
+
+  const workIntervals = [];
+  const pauseIntervals = [];
+  let workedDirectMs = 0;
+  let pausedDirectMs = 0;
+
   for (const session of rtArray(workSessions)) {
     if (!session || typeof session !== 'object') continue;
-    const sessionSector = rtGetSessionSector(session, sector);
-    if (target && rtNormalizeText(sessionSector) && rtNormalizeText(sessionSector) !== target) continue;
-    const { start, end, duration } = rtGetSessionRange(session);
-    let ms = duration;
-    if (!ms && start) {
-      const safeStart = Math.max(start, startLimit || start);
-      const safeEnd = Math.min(end || Date.now(), endLimit || end || Date.now());
-      ms = Math.max(0, safeEnd - safeStart);
-    }
-    if (!ms) continue;
+    if (!rtSessionMatchesSector(session, sector, sector)) continue;
+
+    const { start, end, duration, workedDuration, pausedDuration } = rtGetSessionRange(session);
     const type = rtGetSessionType(session);
-    if (type === 'pause') acc.pausedMs += ms;
-    else acc.workedMs += ms;
+
+    if (type === 'mixed') {
+      workedDirectMs += workedDuration;
+      pausedDirectMs += pausedDuration;
+      continue;
+    }
+
+    if (type === 'pause') {
+      const pauseRange = rtSessionExplicitPauseRange(session);
+      const pStart = pauseRange.start || start;
+      const pEnd = pauseRange.end || end || now;
+      const ms = duration || (pStart ? rtOverlapMs(pStart, pEnd, startLimit, endLimit) : 0);
+
+      if (pStart && pEnd && pEnd > pStart) {
+        const clippedStart = Math.max(pStart, startLimit || pStart);
+        const clippedEnd = Math.min(pEnd, endLimit || pEnd);
+        if (clippedEnd > clippedStart) pauseIntervals.push({ start: clippedStart, end: clippedEnd });
+      } else if (ms > 0) {
+        pausedDirectMs += ms;
+      }
+      continue;
+    }
+
+    // Sessão de trabalho. Quando existe pausa aberta dentro dela, a pausa será
+    // subtraída depois para não contar o mesmo intervalo como trabalhado e pausado.
+    const wStart = start;
+    const wEnd = end || endLimit || now;
+    const ms = duration || (wStart ? rtOverlapMs(wStart, wEnd, startLimit, endLimit) : 0);
+
+    if (wStart && wEnd && wEnd > wStart) {
+      const clippedStart = Math.max(wStart, startLimit || wStart);
+      const clippedEnd = Math.min(wEnd, endLimit || wEnd);
+      if (clippedEnd > clippedStart) workIntervals.push({ start: clippedStart, end: clippedEnd });
+    } else if (ms > 0) {
+      workedDirectMs += ms;
+    }
   }
-  return acc;
+
+  const mergedPauses = rtMergeIntervals(pauseIntervals);
+  const effectiveWorkIntervals = rtSubtractIntervals(workIntervals, mergedPauses);
+
+  return {
+    workedMs: workedDirectMs + rtIntervalsTotalMs(effectiveWorkIntervals),
+    pausedMs: pausedDirectMs + rtIntervalsTotalMs(mergedPauses)
+  };
 }
 
 function rtExtractSectorFromHistoryEvent(event) {
   const direct = String(event?.sector || event?.setor || event?.toSector || event?.to_sector || event?.novoSetor || event?.setorDestino || event?.destinationSector || '').trim();
   if (direct) return direct;
-  const text = String(event?.title || event?.message || event?.description || event?.descricao || event?.acao || '').trim();
+  const text = String(event?.title || event?.message || event?.description || event?.descricao || event?.acao || event?.action || '').trim();
   const lower = rtNormalizeText(text);
   const known = [
     ['laboratorio_revisao', ['laboratorio_revisao', 'laboratorio revisao']],
@@ -399,7 +616,10 @@ function rtExtractSectorFromHistoryEvent(event) {
     ['coloracao', ['coloracao', 'coloração']],
     ['envase', ['envase']],
     ['pcp', ['pcp']],
-    ['pronto_para_entrega', ['pronto_para_entrega', 'pronto entrega']]
+    ['pronto_para_entrega', ['pronto_para_entrega', 'pronto entrega']],
+    ['pronto', ['pronto']],
+    ['entrega', ['entrega']],
+    ['entregue', ['entregue']]
   ];
   for (const [sector, needles] of known) {
     if (needles.some(n => lower.includes(rtNormalizeText(n)))) return sector;
@@ -408,7 +628,7 @@ function rtExtractSectorFromHistoryEvent(event) {
 }
 
 function rtGetHistoryEventTime(event) {
-  return rtPickFirstMs(event?.timestamp, event?.time, event?.date, event?.data, event?.createdAt, event?.created_at, event?.at, event?.quando);
+  return rtPickFirstMs(event?.timestamp, event?.time, event?.date, event?.data, event?.createdAt, event?.created_at, event?.at, event?.quando, event?.updatedAt, event?.updated_at);
 }
 
 function rtCalculateMetricsFromFallback(row) {
@@ -417,56 +637,148 @@ function rtCalculateMetricsFromFallback(row) {
     .map(event => ({ event, sector: rtExtractSectorFromHistoryEvent(event), at: rtGetHistoryEventTime(event) }))
     .filter(item => item.sector && item.at)
     .sort((a, b) => a.at - b.at);
+
   const metrics = [];
+
   for (let i = 0; i < history.length; i++) {
     const current = history[i];
     const next = history[i + 1];
     const enteredAt = current.at;
     const leftAt = next?.at || null;
-    const totalMs = Math.max(0, (leftAt || now) - enteredAt);
-    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, leftAt || now);
-    const workedMs = sessionSum.workedMs;
-    const pausedMs = sessionSum.pausedMs;
+    const effectiveLeftAt = leftAt || now;
+    const totalMs = Math.max(0, effectiveLeftAt - enteredAt);
+    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, effectiveLeftAt);
+    let workedMs = Math.min(sessionSum.workedMs, totalMs);
+    let pausedMs = Math.min(sessionSum.pausedMs, Math.max(0, totalMs - workedMs));
     const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
     const efficiency = totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0;
     metrics.push({ sector: current.sector, enteredAt, leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status: leftAt ? 'Finalizado' : 'Em andamento' });
   }
+
   if (!metrics.length) {
     const currentSector = row.setor_atual || row.ff_lotStatus || 'sem_setor';
     const enteredAt = rtPickFirstMs(row.ff_sectorEnteredAt, row.updated_at, row.data_criacao) || now;
     const totalMs = Math.max(0, now - enteredAt);
     const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, currentSector, enteredAt, now);
-    const workedMs = sessionSum.workedMs;
-    const pausedMs = sessionSum.pausedMs;
+    let workedMs = Math.min(sessionSum.workedMs, totalMs);
+    let pausedMs = Math.min(sessionSum.pausedMs, Math.max(0, totalMs - workedMs));
     const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
     const efficiency = totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0;
     metrics.push({ sector: currentSector, enteredAt, leftAt: null, totalMs, workedMs, pausedMs, idleMs, efficiency, status: 'Em andamento' });
   }
-  return metrics;
+
+  return rtFixMetricsTimeline(metrics, row);
 }
 
 function rtNormalizeMetric(metric, row) {
   const now = Date.now();
   const sector = String(metric?.sector || metric?.setor || metric?.sectorKey || row?.setor_atual || 'sem_setor').trim();
-  const enteredAt = rtPickFirstMs(metric?.enteredAt, metric?.entered_at, metric?.entrada, metric?.start, metric?.inicio, row?.ff_sectorEnteredAt, row?.data_criacao, row?.updated_at) || now;
-  const rawLeftAt = rtPickFirstMs(metric?.leftAt, metric?.left_at, metric?.saida, metric?.end, metric?.fim);
+  const enteredAt = rtPickFirstMs(metric?.enteredAt, metric?.entered_at, metric?.entrada, metric?.start, metric?.inicio, metric?.startedAt, row?.ff_sectorEnteredAt, row?.data_criacao, row?.updated_at) || now;
+  const rawLeftAt = rtPickFirstMs(metric?.leftAt, metric?.left_at, metric?.saida, metric?.exitAt, metric?.end, metric?.fim, metric?.endedAt);
+
+  const totalFromMetric = rtDurationMs(metric?.totalMs ?? metric?.total_ms ?? metric?.tempoTotalMs ?? metric?.tempo_total_ms);
+  const workedFromMetric = rtDurationMs(metric?.workedMs ?? metric?.worked_ms ?? metric?.tempoTrabalhadoMs ?? metric?.tempo_trabalhado_ms);
+  const pausedFromMetric = rtDurationMs(metric?.pausedMs ?? metric?.paused_ms ?? metric?.tempoPausadoMs ?? metric?.tempo_pausado_ms);
+
   const isCurrentSector = rtNormalizeText(sector) === rtNormalizeText(row?.setor_atual || '');
-  const isClosedByMetric = !!rawLeftAt || String(metric?.status || '').toLowerCase().includes('final');
-  const leftAt = rawLeftAt || (isCurrentSector && !isClosedByMetric ? null : rtPickFirstMs(metric?.updatedAt, metric?.updated_at));
+  const metricStatus = rtNormalizeText(metric?.status || metric?.situacao || '');
+  const isClosedByMetric = !!rawLeftAt || metricStatus.includes('final') || metricStatus.includes('done') || metricStatus.includes('conclu');
+  const leftAt = rawLeftAt || (isCurrentSector && !isClosedByMetric ? null : rtPickFirstMs(metric?.updatedAt, metric?.updated_at, row?.updated_at));
   const effectiveLeftAt = leftAt || now;
-  const totalMs = rtDurationMs(metric?.totalMs ?? metric?.total_ms ?? metric?.tempoTotalMs) || Math.max(0, effectiveLeftAt - enteredAt);
+
+  let totalMs = totalFromMetric || Math.max(0, effectiveLeftAt - enteredAt);
   const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, sector, enteredAt, effectiveLeftAt);
-  const workedMs = rtDurationMs(metric?.workedMs ?? metric?.worked_ms ?? metric?.tempoTrabalhadoMs) || sessionSum.workedMs;
-  const pausedMs = rtDurationMs(metric?.pausedMs ?? metric?.paused_ms ?? metric?.tempoPausadoMs) || sessionSum.pausedMs;
-  const idleMs = Math.max(0, rtDurationMs(metric?.idleMs ?? metric?.idle_ms ?? metric?.tempoOciosoMs) || (totalMs - workedMs - pausedMs));
+
+  // IMPORTANTE:
+  // Ocioso NÃO deve virar o "resto" errado quando o trabalhado não veio.
+  // Fórmula correta: total = trabalhado + pausado + ocioso.
+  // Então, se o banco já tem idleMs/tempoOciosoMs salvo e o workedMs veio 0/vazio,
+  // reconstruímos o trabalhado por diferença: worked = total - paused - idle.
+  const idleFromMetric = rtDurationMs(
+    metric?.idleMs ??
+    metric?.idle_ms ??
+    metric?.tempoOciosoMs ??
+    metric?.tempo_ocioso_ms
+  );
+
+  let workedMs = workedFromMetric || sessionSum.workedMs;
+  let pausedMs = pausedFromMetric || sessionSum.pausedMs;
+
+  if ((!workedMs || workedMs <= 0) && totalMs > 0 && idleFromMetric > 0) {
+    const derivedWorked = Math.max(0, totalMs - pausedMs - idleFromMetric);
+    if (derivedWorked > 0) workedMs = derivedWorked;
+  }
+
+  workedMs = Math.min(workedMs, totalMs);
+  pausedMs = Math.min(pausedMs, Math.max(0, totalMs - workedMs));
+  const idleMs = Math.max(0, idleFromMetric || (totalMs - workedMs - pausedMs));
   const efficiencyRaw = metric?.efficiency ?? metric?.eficiencia ?? metric?.efficiencyPct ?? metric?.eficienciaPct;
   const efficiency = Number.isFinite(Number(efficiencyRaw)) ? Math.round(Number(efficiencyRaw)) : (totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0);
+
   return { sector, enteredAt, leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status: leftAt ? 'Finalizado' : 'Em andamento' };
+}
+
+function rtFixMetricsTimeline(metrics, row) {
+  const now = Date.now();
+  const currentSectorNorm = rtNormalizeText(row?.setor_atual || '');
+
+  const sorted = (metrics || [])
+    .filter(Boolean)
+    .map(m => ({ ...m }))
+    .sort((a, b) => Number(a.enteredAt || 0) - Number(b.enteredAt || 0));
+
+  for (let i = 0; i < sorted.length; i++) {
+    const metric = sorted[i];
+    const next = sorted[i + 1];
+    const sectorNorm = rtNormalizeText(metric.sector || '');
+    const isCurrent = currentSectorNorm && sectorNorm === currentSectorNorm;
+
+    // Se existe próximo setor, o setor atual da linha anterior foi finalizado na entrada do próximo.
+    if (!metric.leftAt && next?.enteredAt && Number(next.enteredAt) > Number(metric.enteredAt || 0)) {
+      metric.leftAt = Number(next.enteredAt);
+      metric.status = 'Finalizado';
+    }
+
+    // Se não é o setor atual do lote e não tem saída, usa updated_at como fechamento.
+    if (!metric.leftAt && !isCurrent) {
+      const updated = rtPickFirstMs(row?.updated_at, row?.updatedAt);
+      if (updated && updated > Number(metric.enteredAt || 0)) {
+        metric.leftAt = updated;
+        metric.status = 'Finalizado';
+      }
+    }
+
+    if (!metric.leftAt && isCurrent) {
+      metric.status = 'Em andamento';
+    } else if (metric.leftAt) {
+      metric.status = 'Finalizado';
+    }
+
+    const effectiveLeftAt = metric.leftAt || now;
+    const recalculatedTotal = Math.max(0, effectiveLeftAt - Number(metric.enteredAt || effectiveLeftAt));
+    if (!metric.totalMs || metric.totalMs > recalculatedTotal * 1.2 || metric.totalMs < recalculatedTotal * 0.5) {
+      metric.totalMs = recalculatedTotal;
+    }
+
+    const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, metric.sector, metric.enteredAt, effectiveLeftAt);
+    if (sessionSum.pausedMs > 0) metric.pausedMs = sessionSum.pausedMs;
+    if (sessionSum.workedMs > 0) metric.workedMs = sessionSum.workedMs;
+
+    metric.workedMs = Math.min(Number(metric.workedMs || 0), Number(metric.totalMs || 0));
+    metric.pausedMs = Math.min(Number(metric.pausedMs || 0), Math.max(0, Number(metric.totalMs || 0) - metric.workedMs));
+    metric.idleMs = Math.max(0, Number(metric.totalMs || 0) - metric.workedMs - metric.pausedMs);
+    metric.efficiency = metric.totalMs > 0 ? Math.round((metric.workedMs / metric.totalMs) * 100) : 0;
+  }
+
+  return sorted;
 }
 
 function rtBuildTempoRowsFromLot(row, setorFiltro = '') {
   const parsedMetrics = rtArray(row.ff_sectorMetrics);
-  const baseMetrics = parsedMetrics.length ? parsedMetrics.map(metric => rtNormalizeMetric(metric, row)) : rtCalculateMetricsFromFallback(row);
+  const baseMetrics = parsedMetrics.length
+    ? rtFixMetricsTimeline(parsedMetrics.map(metric => rtNormalizeMetric(metric, row)), row)
+    : rtCalculateMetricsFromFallback(row);
+
   const filterNorm = rtNormalizeText(setorFiltro);
   return baseMetrics
     .filter(metric => !filterNorm || rtNormalizeText(metric.sector) === filterNorm || rtNormalizeText(rtDisplaySector(metric.sector)) === filterNorm)
