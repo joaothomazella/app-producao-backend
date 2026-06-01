@@ -182,6 +182,17 @@ async function ensureSectorShiftTable() {
   `);
 }
 
+async function ensurePedidoDatasTable() {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_pedidos_datas (
+      pedido VARCHAR(30) PRIMARY KEY,
+      data_entrega DATE NOT NULL,
+      atualizado_por VARCHAR(100) NULL,
+      atualizado_em TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+}
+
 async function ensureProductionLotesTimeColumns() {
   const hasProducaoLotes = await tableExists('producao_lotes');
   if (!hasProducaoLotes) return;
@@ -729,6 +740,7 @@ app.get('/', (req, res) => {
       'GET /api/pedidos/:numero',
       'PATCH /api/pedidos/:numero/processado',
       'PATCH /api/pedidos/:numero/desprocessar',
+      'PATCH /api/pedidos/:numero/data-entrega',
       'GET /api/ops',
       'GET /api/ops/:op',
       'GET /api/producao',
@@ -1942,7 +1954,11 @@ app.get('/api/pedidos', async (req, res) => {
           p.pits_numero,
           p.pits_cliente,
           c.cli_nome AS nome_cliente,
-          MIN(p.pits_previsao) AS pits_previsao,
+          COALESCE(fpd.data_entrega, MIN(p.pits_previsao)) AS pits_previsao,
+          COALESCE(fpd.data_entrega, MIN(p.pits_previsao)) AS previsao_entrega,
+          COALESCE(fpd.data_entrega, MIN(p.pits_previsao)) AS deliveryDate,
+          COALESCE(fpd.data_entrega, MIN(p.pits_previsao)) AS data_entrega,
+          fpd.data_entrega AS data_entrega_override,
           COUNT(*) AS total_itens,
           COUNT(DISTINCT p.pits_op) AS total_ops,
           SUM(COALESCE(p.pits_qtde, 0)) AS total_quantidade,
@@ -1952,11 +1968,14 @@ app.get('/api/pedidos', async (req, res) => {
         FROM cli_pedidos_itens p
         LEFT JOIN cli_clientes c
           ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+        LEFT JOIN ff_pedidos_datas fpd
+          ON TRIM(fpd.pedido) = TRIM(p.pits_numero)
         ${where}
         GROUP BY
           p.pits_numero,
           p.pits_cliente,
-          c.cli_nome
+          c.cli_nome,
+          fpd.data_entrega
         ORDER BY ultimo_id DESC
         LIMIT ? OFFSET ?
       `,
@@ -2059,6 +2078,61 @@ app.patch('/api/pedidos/:numero/desprocessar', async (req, res) => {
   }
 });
 
+
+app.patch('/api/pedidos/:numero/data-entrega', async (req, res) => {
+  try {
+    const numero = String(req.params.numero || '').trim();
+    const dataEntrega = String(req.body.data_entrega || req.body.deliveryDate || req.body.previsao_entrega || '').trim();
+
+    if (!numero) {
+      return sendError(res, 400, 'Pedido não informado');
+    }
+
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dataEntrega)) {
+      return sendError(res, 400, 'Data inválida', 'Use o formato YYYY-MM-DD. Exemplo: 2026-06-05');
+    }
+
+    const atualizadoPor = String(
+      req.user?.nome ||
+      req.user?.name ||
+      req.user?.usuario ||
+      req.user?.username ||
+      req.user?.email ||
+      req.authType ||
+      ''
+    ).trim() || null;
+
+    await ensurePedidoDatasTable();
+
+    await dbPool.query(
+      `
+        INSERT INTO ff_pedidos_datas (pedido, data_entrega, atualizado_por)
+        VALUES (?, ?, ?)
+        ON DUPLICATE KEY UPDATE
+          data_entrega = VALUES(data_entrega),
+          atualizado_por = VALUES(atualizado_por),
+          atualizado_em = CURRENT_TIMESTAMP
+      `,
+      [numero, dataEntrega, atualizadoPor]
+    );
+
+    return res.json({
+      ok: true,
+      success: true,
+      message: 'Data de entrega do pedido atualizada para todos os usuários',
+      numero,
+      pedido: numero,
+      data_entrega: dataEntrega,
+      deliveryDate: dataEntrega,
+      previsao_entrega: dataEntrega,
+      atualizado_por: atualizadoPor,
+    });
+  } catch (err) {
+    console.error('PATCH /api/pedidos/:numero/data-entrega erro:', err.message);
+    return sendError(res, 500, 'Erro ao atualizar data de entrega do pedido', err.message);
+  }
+});
+
 app.get('/api/pedidos/:numero', async (req, res) => {
   try {
     const { numero } = req.params;
@@ -2076,7 +2150,11 @@ app.get('/api/pedidos/:numero', async (req, res) => {
           p.pits_numero,
           p.pits_cliente,
           c.cli_nome AS nome_cliente,
-          p.pits_previsao,
+          COALESCE(fpd.data_entrega, p.pits_previsao) AS pits_previsao,
+          COALESCE(fpd.data_entrega, p.pits_previsao) AS previsao_entrega,
+          COALESCE(fpd.data_entrega, p.pits_previsao) AS deliveryDate,
+          COALESCE(fpd.data_entrega, p.pits_previsao) AS data_entrega,
+          fpd.data_entrega AS data_entrega_override,
           p.pits_produto,
           p.pits_op,
           p.pits_nome_produto,
@@ -2095,6 +2173,8 @@ app.get('/api/pedidos/:numero', async (req, res) => {
         FROM cli_pedidos_itens p
         LEFT JOIN cli_clientes c
           ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(p.pits_cliente) AS UNSIGNED)
+        LEFT JOIN ff_pedidos_datas fpd
+          ON TRIM(fpd.pedido) = TRIM(p.pits_numero)
         WHERE p.pits_numero = ?
         ORDER BY p.id ASC
       `,
@@ -2537,9 +2617,11 @@ app.get('/api/producao/ativos', async (req, res) => {
           COALESCE(NULLIF(pl.quantidade, 0), erp.pits_peso, erp.pits_qtde, 0) AS quantidade,
           erp.pits_qtde,
           erp.pits_peso,
-          erp.pits_previsao,
-          erp.pits_previsao AS deliveryDate,
-          erp.pits_previsao AS previsao_entrega,
+          COALESCE(fpd.data_entrega, erp.pits_previsao) AS pits_previsao,
+          COALESCE(fpd.data_entrega, erp.pits_previsao) AS deliveryDate,
+          COALESCE(fpd.data_entrega, erp.pits_previsao) AS previsao_entrega,
+          COALESCE(fpd.data_entrega, erp.pits_previsao) AS data_entrega,
+          fpd.data_entrega AS data_entrega_override,
           COALESCE(NULLIF(TRIM(pl.cliente_endereco), ''), c.cli_endereco, '') AS cliente_endereco,
           COALESCE(NULLIF(TRIM(pl.cliente_bairro), ''), c.cli_bairro, '') AS cliente_bairro,
           COALESCE(NULLIF(TRIM(pl.cliente_cidade), ''), c.cli_cidade, '') AS cliente_cidade,
@@ -2570,6 +2652,8 @@ app.get('/api/producao/ativos', async (req, res) => {
           GROUP BY TRIM(pits_op)
         ) erp
           ON TRIM(erp.pits_op) = TRIM(pl.op)
+        LEFT JOIN ff_pedidos_datas fpd
+          ON TRIM(fpd.pedido) = TRIM(pl.numero_pedido)
         LEFT JOIN cli_clientes c
           ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(pl.cliente_codigo) AS UNSIGNED)
         WHERE
@@ -3071,14 +3155,30 @@ app.get('/api/producao', async (req, res) => {
           pl.*,
 
           COALESCE(
+            fpd.data_entrega,
             pi_op.pits_previsao,
             pi_pedido.pits_previsao
           ) AS pits_previsao,
 
           COALESCE(
+            fpd.data_entrega,
             pi_op.pits_previsao,
             pi_pedido.pits_previsao
           ) AS previsao_entrega,
+
+          COALESCE(
+            fpd.data_entrega,
+            pi_op.pits_previsao,
+            pi_pedido.pits_previsao
+          ) AS deliveryDate,
+
+          COALESCE(
+            fpd.data_entrega,
+            pi_op.pits_previsao,
+            pi_pedido.pits_previsao
+          ) AS data_entrega,
+
+          fpd.data_entrega AS data_entrega_override,
 
           COALESCE(
             pi_op.pits_numero,
@@ -3148,6 +3248,9 @@ app.get('/api/producao', async (req, res) => {
 
         FROM producao_lotes pl
 
+        LEFT JOIN ff_pedidos_datas fpd
+          ON TRIM(fpd.pedido) = TRIM(pl.numero_pedido)
+
         LEFT JOIN cli_pedidos_itens pi_op
           ON TRIM(pi_op.pits_op) = TRIM(pl.op)
 
@@ -3191,9 +3294,10 @@ app.get('/api/producao', async (req, res) => {
 
       // Compatibilidade com o front:
       // data.js procura estes nomes.
-      deliveryDate: row.pits_previsao || row.previsao_entrega || null,
-      delivery_date: row.pits_previsao || row.previsao_entrega || null,
-      data_entrega: row.pits_previsao || row.previsao_entrega || null,
+      deliveryDate: row.deliveryDate || row.pits_previsao || row.previsao_entrega || null,
+      delivery_date: row.deliveryDate || row.pits_previsao || row.previsao_entrega || null,
+      data_entrega: row.data_entrega || row.deliveryDate || row.pits_previsao || row.previsao_entrega || null,
+      deliveryDateManual: row.data_entrega_override || null,
 
       // Se o pedido real trouxe dados melhores que o lote manual, já devolve enriquecido.
       cliente_nome: row.nome_cliente_pedido || row.cliente_nome,
@@ -3313,6 +3417,7 @@ app.patch('/api/producao/:id', async (req, res) => {
 app.get('/api/expediente', async (req, res) => {
   try {
     await ensureSectorShiftTable();
+    await ensurePedidoDatasTable();
 
     const [rows] = await dbPool.query(`
       SELECT
@@ -3336,6 +3441,7 @@ app.get('/api/expediente', async (req, res) => {
 app.get('/api/expediente/:setor', async (req, res) => {
   try {
     await ensureSectorShiftTable();
+    await ensurePedidoDatasTable();
 
     const setor = normalizeShiftSetor(req.params.setor);
     if (!setor) return sendError(res, 400, 'Setor obrigatório');
@@ -3369,6 +3475,7 @@ app.get('/api/expediente/:setor', async (req, res) => {
 app.post('/api/expediente/toggle', async (req, res) => {
   try {
     await ensureSectorShiftTable();
+    await ensurePedidoDatasTable();
 
     const setor = normalizeShiftSetor(req.body?.setor);
     const aberto = Number(req.body?.expediente_aberto) === 1 || req.body?.expediente_aberto === true;
@@ -5672,6 +5779,7 @@ app.use((req, res) => {
     await testConnection();
     await ensureProductionLotesManualColumns();
     await ensureSectorShiftTable();
+    await ensurePedidoDatasTable();
     await ensureProductionLotesTimeColumns();
 
     app.listen(PORT, () => {
@@ -5686,6 +5794,7 @@ app.use((req, res) => {
       console.log('   GET  /api/pedidos/:numero');
       console.log('   PATCH /api/pedidos/:numero/processado');
       console.log('   PATCH /api/pedidos/:numero/desprocessar');
+      console.log('   PATCH /api/pedidos/:numero/data-entrega');
       console.log('   GET  /api/ops');
       console.log('   GET  /api/ops/:op');
       console.log('   GET  /api/producao');
