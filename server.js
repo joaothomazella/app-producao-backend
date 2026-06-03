@@ -522,16 +522,113 @@ function rtSubtractIntervals(baseIntervals, subtractIntervals) {
 }
 
 
+// ─────────────────────────────────────────────────────────────
+// EXPEDIENTE ÚTIL - DESCONTA PERÍODOS FECHADOS
+// Regra FactoryFlow:
+// Entrou no setor => começa a contar.
+// Fechou expediente => congela.
+// Abriu expediente => continua do ponto congelado.
+// Saiu do setor => finaliza.
+//
+// Além dos eventos reais salvos em ff_sector_shift_events, usamos uma
+// proteção de expediente padrão para impedir contagem corrida durante a noite
+// quando ainda não há histórico completo salvo no banco.
+// Horário padrão em America/Sao_Paulo, sem horário de verão.
+// ─────────────────────────────────────────────────────────────
+const RT_WORKDAY_START_MINUTES = 7 * 60 + 10;   // 07:10
+const RT_WORKDAY_END_MINUTES = 17 * 60 + 25;    // 17:25
+const RT_SAO_PAULO_OFFSET_MINUTES = -180;       // UTC-03:00
+
+function rtSaoPauloParts(ms) {
+  const d = new Date(Number(ms || 0) + RT_SAO_PAULO_OFFSET_MINUTES * 60000);
+  return {
+    year: d.getUTCFullYear(),
+    month: d.getUTCMonth() + 1,
+    day: d.getUTCDate(),
+    hour: d.getUTCHours(),
+    minute: d.getUTCMinutes(),
+    second: d.getUTCSeconds(),
+    dayOfWeek: d.getUTCDay()
+  };
+}
+
+function rtSaoPauloLocalToMs(year, month, day, hour = 0, minute = 0, second = 0) {
+  return Date.UTC(year, month - 1, day, hour, minute, second, 0) - RT_SAO_PAULO_OFFSET_MINUTES * 60000;
+}
+
+function rtAddDaysSaoPauloYmd(year, month, day, addDays) {
+  const base = Date.UTC(year, month - 1, day + addDays, 12, 0, 0, 0);
+  const d = new Date(base);
+  return { year: d.getUTCFullYear(), month: d.getUTCMonth() + 1, day: d.getUTCDate() };
+}
+
+function rtGetStandardClosedIntervals(startMs, endMs) {
+  const start = Number(startMs || 0);
+  const end = Number(endMs || Date.now());
+  if (!start || !end || end <= start) return [];
+
+  const intervals = [];
+  const startParts = rtSaoPauloParts(start);
+  const endParts = rtSaoPauloParts(end);
+
+  let cursorYmd = { year: startParts.year, month: startParts.month, day: startParts.day };
+  const endDayStart = rtSaoPauloLocalToMs(endParts.year, endParts.month, endParts.day, 0, 0, 0);
+
+  for (let guard = 0; guard < 370; guard++) {
+    const dayStart = rtSaoPauloLocalToMs(cursorYmd.year, cursorYmd.month, cursorYmd.day, 0, 0, 0);
+    if (dayStart > end) break;
+
+    const workStart = rtSaoPauloLocalToMs(
+      cursorYmd.year,
+      cursorYmd.month,
+      cursorYmd.day,
+      Math.floor(RT_WORKDAY_START_MINUTES / 60),
+      RT_WORKDAY_START_MINUTES % 60,
+      0
+    );
+    const workEnd = rtSaoPauloLocalToMs(
+      cursorYmd.year,
+      cursorYmd.month,
+      cursorYmd.day,
+      Math.floor(RT_WORKDAY_END_MINUTES / 60),
+      RT_WORKDAY_END_MINUTES % 60,
+      0
+    );
+    const nextDay = rtAddDaysSaoPauloYmd(cursorYmd.year, cursorYmd.month, cursorYmd.day, 1);
+    const nextDayStart = rtSaoPauloLocalToMs(nextDay.year, nextDay.month, nextDay.day, 0, 0, 0);
+
+    // Fora do expediente padrão do dia.
+    intervals.push({ start: dayStart, end: workStart });
+    intervals.push({ start: workEnd, end: nextDayStart });
+
+    if (dayStart >= endDayStart && nextDayStart > end) break;
+    cursorYmd = nextDay;
+  }
+
+  return rtMergeIntervals(intervals)
+    .map(i => ({ start: Math.max(i.start, start), end: Math.min(i.end, end) }))
+    .filter(i => i.start > 0 && i.end > i.start);
+}
+
+
 function rtGetShiftKeyForSector(sector) {
   return normalizeShiftSetor(rtNormalizeText(sector || '')) || rtNormalizeText(sector || '');
 }
 
 function rtGetClosedIntervalsForSector(shiftClosedMap, sector, startMs, endMs) {
   const key = rtGetShiftKeyForSector(sector);
-  const intervals = Array.isArray(shiftClosedMap?.[key]) ? shiftClosedMap[key] : [];
+  const eventIntervals = Array.isArray(shiftClosedMap?.[key]) ? shiftClosedMap[key] : [];
   const start = Number(startMs || 0);
   const end = Number(endMs || Date.now());
-  return rtMergeIntervals(intervals)
+  if (!start || !end || end <= start) return [];
+
+  // Eventos reais de abre/fecha expediente + fallback de expediente padrão.
+  // Isso impede que o relatório conte a noite inteira quando o lote ficou parado
+  // no setor após o expediente fechado.
+  const standardClosed = rtGetStandardClosedIntervals(start, end);
+  const allClosed = [...eventIntervals, ...standardClosed];
+
+  return rtMergeIntervals(allClosed)
     .map(i => ({ start: Math.max(Number(i.start || 0), start), end: Math.min(Number(i.end || 0), end) }))
     .filter(i => i.start > 0 && i.end > i.start);
 }
@@ -822,7 +919,12 @@ function rtNormalizeMetric(metric, row, shiftClosedMap = {}) {
   const leftAt = rawLeftAt || (isCurrentSector && !isClosedByMetric ? null : rtPickFirstMs(metric?.updatedAt, metric?.updated_at, row?.updated_at));
   const effectiveLeftAt = leftAt || now;
 
-  let totalMs = totalFromMetric || rtBusinessDurationMs(enteredAt, effectiveLeftAt, sector, shiftClosedMap);
+  // Sempre recalcula o total útil pelo intervalo de entrada/saída descontando expediente fechado.
+  // Não confia em totalMs antigo salvo em ff_sectorMetrics, porque ele pode ter sido gravado corrido.
+  let totalMs = rtBusinessDurationMs(enteredAt, effectiveLeftAt, sector, shiftClosedMap);
+  if (!totalMs && totalFromMetric && !rtGetClosedIntervalsForSector(shiftClosedMap, sector, enteredAt, effectiveLeftAt).length) {
+    totalMs = totalFromMetric;
+  }
   const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, sector, enteredAt, effectiveLeftAt, shiftClosedMap);
 
   // IMPORTANTE:
@@ -892,9 +994,8 @@ function rtFixMetricsTimeline(metrics, row, shiftClosedMap = {}) {
 
     const effectiveLeftAt = metric.leftAt || now;
     const recalculatedTotal = rtBusinessDurationMs(Number(metric.enteredAt || effectiveLeftAt), effectiveLeftAt, metric.sector, shiftClosedMap);
-    if (!metric.totalMs || metric.totalMs > recalculatedTotal * 1.2 || metric.totalMs < recalculatedTotal * 0.5) {
-      metric.totalMs = recalculatedTotal;
-    }
+    // Sempre usa o total útil recalculado. O valor antigo pode ter contado período fechado.
+    metric.totalMs = recalculatedTotal;
 
     const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, metric.sector, metric.enteredAt, effectiveLeftAt, shiftClosedMap);
     if (sessionSum.pausedMs > 0) metric.pausedMs = sessionSum.pausedMs;
