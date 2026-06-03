@@ -45,7 +45,13 @@ const corsOptions = {
   origin: function (origin, callback) {
     if (!origin) return callback(null, true); // permite Postman/testes/curl
 
-    if (allowedOrigins.includes(origin)) {
+    let hostname = '';
+    try { hostname = new URL(origin).hostname; } catch (_) { hostname = ''; }
+
+    const isGenspark = hostname === 'gensparkspace.com' || hostname.endsWith('.gensparkspace.com');
+    const isLocalhost = hostname === 'localhost' || hostname === '127.0.0.1';
+
+    if (allowedOrigins.includes(origin) || isGenspark || isLocalhost) {
       return callback(null, true);
     }
 
@@ -178,6 +184,21 @@ async function ensureSectorShiftTable() {
       iniciado_em DATETIME NULL,
       finalizado_em DATETIME NULL,
       atualizado_em DATETIME DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    )
+  `);
+}
+
+
+async function ensureSectorShiftEventsTable() {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_sector_shift_events (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      setor VARCHAR(80) NOT NULL,
+      event_type VARCHAR(20) NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      created_by VARCHAR(120) NULL,
+      INDEX idx_ff_sector_shift_events_setor_created (setor, created_at),
+      INDEX idx_ff_sector_shift_events_type_created (event_type, created_at)
     )
   `);
 }
@@ -500,6 +521,95 @@ function rtSubtractIntervals(baseIntervals, subtractIntervals) {
   return rtMergeIntervals(result);
 }
 
+
+function rtGetShiftKeyForSector(sector) {
+  return normalizeShiftSetor(rtNormalizeText(sector || '')) || rtNormalizeText(sector || '');
+}
+
+function rtGetClosedIntervalsForSector(shiftClosedMap, sector, startMs, endMs) {
+  const key = rtGetShiftKeyForSector(sector);
+  const intervals = Array.isArray(shiftClosedMap?.[key]) ? shiftClosedMap[key] : [];
+  const start = Number(startMs || 0);
+  const end = Number(endMs || Date.now());
+  return rtMergeIntervals(intervals)
+    .map(i => ({ start: Math.max(Number(i.start || 0), start), end: Math.min(Number(i.end || 0), end) }))
+    .filter(i => i.start > 0 && i.end > i.start);
+}
+
+function rtBusinessIntervals(startMs, endMs, sector, shiftClosedMap = {}) {
+  const start = Number(startMs || 0);
+  const end = Number(endMs || Date.now());
+  if (!start || !end || end <= start) return [];
+  const base = [{ start, end }];
+  const closed = rtGetClosedIntervalsForSector(shiftClosedMap, sector, start, end);
+  return rtSubtractIntervals(base, closed);
+}
+
+function rtBusinessDurationMs(startMs, endMs, sector, shiftClosedMap = {}) {
+  return rtIntervalsTotalMs(rtBusinessIntervals(startMs, endMs, sector, shiftClosedMap));
+}
+
+async function rtLoadShiftClosedIntervals() {
+  const map = {};
+  try {
+    await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
+
+    const [events] = await dbPool.query(`
+      SELECT setor, event_type, created_at
+      FROM ff_sector_shift_events
+      ORDER BY setor ASC, created_at ASC, id ASC
+    `);
+
+    const openCloseBySetor = new Map();
+    for (const ev of events || []) {
+      const key = rtGetShiftKeyForSector(ev.setor);
+      const type = rtNormalizeText(ev.event_type);
+      const at = rtToMs(ev.created_at);
+      if (!key || !at) continue;
+      if (!map[key]) map[key] = [];
+
+      if (type.includes('fech') || type === 'closed' || type === 'close') {
+        openCloseBySetor.set(key, at);
+      } else if (type.includes('aber') || type === 'open' || type === 'opened') {
+        const start = openCloseBySetor.get(key);
+        if (start && at > start) map[key].push({ start, end: at });
+        openCloseBySetor.delete(key);
+      }
+    }
+
+    const [shifts] = await dbPool.query(`
+      SELECT setor, expediente_aberto, iniciado_em, finalizado_em
+      FROM ff_sector_shifts
+    `);
+
+    const now = Date.now();
+    for (const row of shifts || []) {
+      const key = rtGetShiftKeyForSector(row.setor);
+      if (!key) continue;
+      if (!map[key]) map[key] = [];
+      const isOpen = Number(row.expediente_aberto || 0) === 1;
+      const closedAt = rtToMs(row.finalizado_em);
+      const openedAt = rtToMs(row.iniciado_em);
+
+      // Se está fechado agora, congela desde finalizado_em até agora.
+      if (!isOpen && closedAt) {
+        map[key].push({ start: closedAt, end: now });
+      }
+
+      // Proteção para base antiga: se há finalizado_em e depois iniciado_em, adiciona o intervalo fechado.
+      if (isOpen && closedAt && openedAt && openedAt > closedAt) {
+        map[key].push({ start: closedAt, end: openedAt });
+      }
+    }
+
+    for (const key of Object.keys(map)) map[key] = rtMergeIntervals(map[key]);
+  } catch (err) {
+    console.warn('[relatorio-tempos] não foi possível carregar histórico de expediente:', err.message);
+  }
+  return map;
+}
+
 function rtSessionExplicitPauseRange(session) {
   const start = rtPickFirstMs(
     session?.pauseStart,
@@ -533,7 +643,7 @@ function rtSessionExplicitPauseRange(session) {
   return { start, end };
 }
 
-function rtSumWorkSessionsBySector(workSessions, sector, enteredAt, leftAt) {
+function rtSumWorkSessionsBySector(workSessions, sector, enteredAt, leftAt, shiftClosedMap = {}) {
   const startLimit = Number(enteredAt || 0);
   const endLimit = Number(leftAt || Date.now());
   const now = Date.now();
@@ -587,8 +697,9 @@ function rtSumWorkSessionsBySector(workSessions, sector, enteredAt, leftAt) {
     }
   }
 
-  const mergedPauses = rtMergeIntervals(pauseIntervals);
-  const effectiveWorkIntervals = rtSubtractIntervals(workIntervals, mergedPauses);
+  const closedIntervals = rtGetClosedIntervalsForSector(shiftClosedMap, sector, startLimit, endLimit);
+  const mergedPauses = rtSubtractIntervals(rtMergeIntervals(pauseIntervals), closedIntervals);
+  const effectiveWorkIntervals = rtSubtractIntervals(rtSubtractIntervals(workIntervals, mergedPauses), closedIntervals);
 
   return {
     workedMs: workedDirectMs + rtIntervalsTotalMs(effectiveWorkIntervals),
@@ -631,7 +742,7 @@ function rtGetHistoryEventTime(event) {
   return rtPickFirstMs(event?.timestamp, event?.time, event?.date, event?.data, event?.createdAt, event?.created_at, event?.at, event?.quando, event?.updatedAt, event?.updated_at);
 }
 
-function rtCalculateMetricsFromFallback(row) {
+function rtCalculateMetricsFromFallback(row, shiftClosedMap = {}) {
   const now = Date.now();
   const history = rtArray(row.ff_history)
     .map(event => ({ event, sector: rtExtractSectorFromHistoryEvent(event), at: rtGetHistoryEventTime(event) }))
@@ -646,8 +757,8 @@ function rtCalculateMetricsFromFallback(row) {
     const enteredAt = current.at;
     const leftAt = next?.at || null;
     const effectiveLeftAt = leftAt || now;
-    const totalMs = Math.max(0, effectiveLeftAt - enteredAt);
-    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, effectiveLeftAt);
+    const totalMs = rtBusinessDurationMs(enteredAt, effectiveLeftAt, current.sector, shiftClosedMap);
+    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, effectiveLeftAt, shiftClosedMap);
     let workedMs = Math.min(sessionSum.workedMs, totalMs);
     let pausedMs = Math.min(sessionSum.pausedMs, Math.max(0, totalMs - workedMs));
     const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
@@ -658,8 +769,8 @@ function rtCalculateMetricsFromFallback(row) {
   if (!metrics.length) {
     const currentSector = row.setor_atual || row.ff_lotStatus || 'sem_setor';
     const enteredAt = rtPickFirstMs(row.ff_sectorEnteredAt, row.updated_at, row.data_criacao) || now;
-    const totalMs = Math.max(0, now - enteredAt);
-    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, currentSector, enteredAt, now);
+    const totalMs = rtBusinessDurationMs(enteredAt, now, currentSector, shiftClosedMap);
+    const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, currentSector, enteredAt, now, shiftClosedMap);
     let workedMs = Math.min(sessionSum.workedMs, totalMs);
     let pausedMs = Math.min(sessionSum.pausedMs, Math.max(0, totalMs - workedMs));
     const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
@@ -667,10 +778,10 @@ function rtCalculateMetricsFromFallback(row) {
     metrics.push({ sector: currentSector, enteredAt, leftAt: null, totalMs, workedMs, pausedMs, idleMs, efficiency, status: 'Em andamento' });
   }
 
-  return rtFixMetricsTimeline(metrics, row);
+  return rtFixMetricsTimeline(metrics, row, shiftClosedMap);
 }
 
-function rtNormalizeMetric(metric, row) {
+function rtNormalizeMetric(metric, row, shiftClosedMap = {}) {
   const now = Date.now();
   const sector = String(metric?.sector || metric?.setor || metric?.sectorKey || row?.setor_atual || 'sem_setor').trim();
   const enteredAt = rtPickFirstMs(metric?.enteredAt, metric?.entered_at, metric?.entrada, metric?.start, metric?.inicio, metric?.startedAt, row?.ff_sectorEnteredAt, row?.data_criacao, row?.updated_at) || now;
@@ -686,8 +797,8 @@ function rtNormalizeMetric(metric, row) {
   const leftAt = rawLeftAt || (isCurrentSector && !isClosedByMetric ? null : rtPickFirstMs(metric?.updatedAt, metric?.updated_at, row?.updated_at));
   const effectiveLeftAt = leftAt || now;
 
-  let totalMs = totalFromMetric || Math.max(0, effectiveLeftAt - enteredAt);
-  const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, sector, enteredAt, effectiveLeftAt);
+  let totalMs = totalFromMetric || rtBusinessDurationMs(enteredAt, effectiveLeftAt, sector, shiftClosedMap);
+  const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, sector, enteredAt, effectiveLeftAt, shiftClosedMap);
 
   // IMPORTANTE:
   // Ocioso NÃO deve virar o "resto" errado quando o trabalhado não veio.
@@ -718,7 +829,7 @@ function rtNormalizeMetric(metric, row) {
   return { sector, enteredAt, leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status: leftAt ? 'Finalizado' : 'Em andamento' };
 }
 
-function rtFixMetricsTimeline(metrics, row) {
+function rtFixMetricsTimeline(metrics, row, shiftClosedMap = {}) {
   const now = Date.now();
   const currentSectorNorm = rtNormalizeText(row?.setor_atual || '');
 
@@ -755,12 +866,12 @@ function rtFixMetricsTimeline(metrics, row) {
     }
 
     const effectiveLeftAt = metric.leftAt || now;
-    const recalculatedTotal = Math.max(0, effectiveLeftAt - Number(metric.enteredAt || effectiveLeftAt));
+    const recalculatedTotal = rtBusinessDurationMs(Number(metric.enteredAt || effectiveLeftAt), effectiveLeftAt, metric.sector, shiftClosedMap);
     if (!metric.totalMs || metric.totalMs > recalculatedTotal * 1.2 || metric.totalMs < recalculatedTotal * 0.5) {
       metric.totalMs = recalculatedTotal;
     }
 
-    const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, metric.sector, metric.enteredAt, effectiveLeftAt);
+    const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, metric.sector, metric.enteredAt, effectiveLeftAt, shiftClosedMap);
     if (sessionSum.pausedMs > 0) metric.pausedMs = sessionSum.pausedMs;
     if (sessionSum.workedMs > 0) metric.workedMs = sessionSum.workedMs;
 
@@ -773,11 +884,11 @@ function rtFixMetricsTimeline(metrics, row) {
   return sorted;
 }
 
-function rtBuildTempoRowsFromLot(row, setorFiltro = '') {
+function rtBuildTempoRowsFromLot(row, setorFiltro = '', shiftClosedMap = {}) {
   const parsedMetrics = rtArray(row.ff_sectorMetrics);
   const baseMetrics = parsedMetrics.length
-    ? rtFixMetricsTimeline(parsedMetrics.map(metric => rtNormalizeMetric(metric, row)), row)
-    : rtCalculateMetricsFromFallback(row);
+    ? rtFixMetricsTimeline(parsedMetrics.map(metric => rtNormalizeMetric(metric, row, shiftClosedMap)), row, shiftClosedMap)
+    : rtCalculateMetricsFromFallback(row, shiftClosedMap);
 
   const filterNorm = rtNormalizeText(setorFiltro);
   return baseMetrics
@@ -3353,8 +3464,10 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
       [...params, limit, offset]
     );
 
+    const shiftClosedMap = await rtLoadShiftClosedIntervals();
+
     let data = [];
-    for (const lote of lotes) data.push(...rtBuildTempoRowsFromLot(lote, setor));
+    for (const lote of lotes) data.push(...rtBuildTempoRowsFromLot(lote, setor, shiftClosedMap));
 
     if (inicio || fim) {
       const inicioMs = inicio ? rtToMs(`${inicio}T00:00:00-03:00`) : null;
@@ -3729,6 +3842,7 @@ app.patch('/api/producao/:id', async (req, res) => {
 app.get('/api/expediente', async (req, res) => {
   try {
     await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
     await ensurePedidoDatasTable();
 
     const [rows] = await dbPool.query(`
@@ -3753,6 +3867,7 @@ app.get('/api/expediente', async (req, res) => {
 app.get('/api/expediente/:setor', async (req, res) => {
   try {
     await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
     await ensurePedidoDatasTable();
 
     const setor = normalizeShiftSetor(req.params.setor);
@@ -3787,6 +3902,7 @@ app.get('/api/expediente/:setor', async (req, res) => {
 app.post('/api/expediente/toggle', async (req, res) => {
   try {
     await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
     await ensurePedidoDatasTable();
 
     const setor = normalizeShiftSetor(req.body?.setor);
@@ -3818,6 +3934,12 @@ app.post('/api/expediente/toggle', async (req, res) => {
         [setor]
       );
     }
+
+    await ensureSectorShiftEventsTable();
+    await dbPool.query(
+      `INSERT INTO ff_sector_shift_events (setor, event_type, created_by) VALUES (?, ?, ?)`,
+      [setor, aberto ? 'aberto' : 'fechado', req.user?.name || req.user?.email || req.authType || null]
+    );
 
     const [rows] = await dbPool.query(
       `SELECT * FROM ff_sector_shifts WHERE setor = ? LIMIT 1`,
@@ -6091,6 +6213,7 @@ app.use((req, res) => {
     await testConnection();
     await ensureProductionLotesManualColumns();
     await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
     await ensurePedidoDatasTable();
     await ensureProductionLotesTimeColumns();
 
