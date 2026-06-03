@@ -744,18 +744,43 @@ function rtGetHistoryEventTime(event) {
 
 function rtCalculateMetricsFromFallback(row, shiftClosedMap = {}) {
   const now = Date.now();
+  const finalSectors = new Set(['pronto', 'entrega', 'entregue', 'finalizado', 'concluido', 'concluído']);
+  const currentSector = String(row?.setor_atual || row?.status || '').trim();
+  const currentSectorNorm = rtNormalizeText(currentSector);
+  const lotStatusNorm = rtNormalizeText(row?.ff_lotStatus || row?.status || '');
+  const isFinalLot = finalSectors.has(currentSectorNorm) || lotStatusNorm.includes('final') || lotStatusNorm.includes('entregue');
+
   const history = rtArray(row.ff_history)
-    .map(event => ({ event, sector: rtExtractSectorFromHistoryEvent(event), at: rtGetHistoryEventTime(event) }))
+    .map((event, idx) => ({ event, sector: rtExtractSectorFromHistoryEvent(event), at: rtGetHistoryEventTime(event), idx }))
     .filter(item => item.sector && item.at)
-    .sort((a, b) => a.at - b.at);
+    .sort((a, b) => a.at - b.at || a.idx - b.idx);
 
   const metrics = [];
 
   for (let i = 0; i < history.length; i++) {
     const current = history[i];
     const next = history[i + 1];
+    const sectorNorm = rtNormalizeText(current.sector || '');
+
+    // Eventos finais não devem virar cartão de tempo produtivo.
+    if (finalSectors.has(sectorNorm)) continue;
+
     const enteredAt = current.at;
-    const leftAt = next?.at || null;
+    let leftAt = next?.at || null;
+    let status = 'Finalizado';
+
+    if (!leftAt) {
+      if (!isFinalLot && currentSectorNorm && sectorNorm === currentSectorNorm) {
+        status = 'Em andamento';
+      } else {
+        leftAt = rtPickFirstMs(row.updated_at, row.updatedAt, row.deliveredAt, row.finalizadoEm) || enteredAt;
+        status = 'Finalizado';
+      }
+    }
+
+    // Proteção contra dados corrompidos ou métrica antiga invertida.
+    if (leftAt && leftAt < enteredAt) continue;
+
     const effectiveLeftAt = leftAt || now;
     const totalMs = rtBusinessDurationMs(enteredAt, effectiveLeftAt, current.sector, shiftClosedMap);
     const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, effectiveLeftAt, shiftClosedMap);
@@ -763,11 +788,11 @@ function rtCalculateMetricsFromFallback(row, shiftClosedMap = {}) {
     let pausedMs = Math.min(sessionSum.pausedMs, Math.max(0, totalMs - workedMs));
     const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
     const efficiency = totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0;
-    metrics.push({ sector: current.sector, enteredAt, leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status: leftAt ? 'Finalizado' : 'Em andamento' });
+    metrics.push({ sector: current.sector, enteredAt, leftAt: status === 'Em andamento' ? null : leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status });
   }
 
-  if (!metrics.length) {
-    const currentSector = row.setor_atual || row.ff_lotStatus || 'sem_setor';
+  // Fallback só quando não há histórico confiável.
+  if (!metrics.length && currentSector && !finalSectors.has(currentSectorNorm)) {
     const enteredAt = rtPickFirstMs(row.ff_sectorEnteredAt, row.updated_at, row.data_criacao) || now;
     const totalMs = rtBusinessDurationMs(enteredAt, now, currentSector, shiftClosedMap);
     const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, currentSector, enteredAt, now, shiftClosedMap);
@@ -885,10 +910,16 @@ function rtFixMetricsTimeline(metrics, row, shiftClosedMap = {}) {
 }
 
 function rtBuildTempoRowsFromLot(row, setorFiltro = '', shiftClosedMap = {}) {
+  // Fonte de verdade da sequência: ff_history.
+  // ff_sectorMetrics pode conter registros antigos/corrompidos com entrada/saída invertidas
+  // ou setores fora do fluxo; por isso só usamos metrics quando não existe histórico.
+  const historyItems = rtArray(row.ff_history);
   const parsedMetrics = rtArray(row.ff_sectorMetrics);
-  const baseMetrics = parsedMetrics.length
-    ? rtFixMetricsTimeline(parsedMetrics.map(metric => rtNormalizeMetric(metric, row, shiftClosedMap)), row, shiftClosedMap)
-    : rtCalculateMetricsFromFallback(row, shiftClosedMap);
+  const baseMetrics = historyItems.length
+    ? rtCalculateMetricsFromFallback(row, shiftClosedMap)
+    : (parsedMetrics.length
+        ? rtFixMetricsTimeline(parsedMetrics.map(metric => rtNormalizeMetric(metric, row, shiftClosedMap)), row, shiftClosedMap)
+        : rtCalculateMetricsFromFallback(row, shiftClosedMap));
 
   const filterNorm = rtNormalizeText(setorFiltro);
   return baseMetrics
