@@ -839,6 +839,174 @@ function rtGetHistoryEventTime(event) {
   return rtPickFirstMs(event?.timestamp, event?.time, event?.date, event?.data, event?.createdAt, event?.created_at, event?.at, event?.quando, event?.updatedAt, event?.updated_at);
 }
 
+
+function rtMetricDurationFrom(metric, ...keys) {
+  for (const key of keys) {
+    const value = metric?.[key];
+    const ms = rtDurationMs(value);
+    if (ms > 0) return ms;
+  }
+  return 0;
+}
+
+function rtGetStoredMetricDurations(metric) {
+  if (!metric || typeof metric !== 'object') {
+    return { totalMs: 0, workedMs: 0, pausedMs: 0, idleMs: 0, efficiency: null };
+  }
+
+  const totalMs = rtMetricDurationFrom(
+    metric,
+    'totalMs', 'total_ms', 'tempoTotalMs', 'tempo_total_ms',
+    'durationMs', 'duration_ms', 'elapsedMs', 'elapsed_ms'
+  );
+
+  const workedMs = rtMetricDurationFrom(
+    metric,
+    'workedMs', 'worked_ms', 'tempoTrabalhadoMs', 'tempo_trabalhado_ms',
+    'trabalhadoMs', 'trabalhado_ms'
+  );
+
+  const pausedMs = rtMetricDurationFrom(
+    metric,
+    'pausedMs', 'paused_ms', 'tempoPausadoMs', 'tempo_pausado_ms',
+    'pausadoMs', 'pausado_ms'
+  );
+
+  const idleMs = rtMetricDurationFrom(
+    metric,
+    'idleMs', 'idle_ms', 'tempoOciosoMs', 'tempo_ocioso_ms',
+    'ociosoMs', 'ocioso_ms'
+  );
+
+  const effRaw = metric?.efficiency ?? metric?.eficiencia ?? metric?.efficiencyPct ?? metric?.eficienciaPct;
+  const efficiency = Number.isFinite(Number(effRaw)) ? Math.round(Number(effRaw)) : null;
+
+  return { totalMs, workedMs, pausedMs, idleMs, efficiency };
+}
+
+function rtGetMetricSector(metric, fallbackSector = '') {
+  return String(
+    metric?.sector ||
+    metric?.setor ||
+    metric?.sectorKey ||
+    metric?.setorKey ||
+    metric?.nomeSetor ||
+    metric?.setor_nome ||
+    fallbackSector ||
+    ''
+  ).trim();
+}
+
+function rtMetricMatchesSector(metric, targetSector) {
+  const metricSector = rtGetMetricSector(metric);
+  if (!metricSector || !targetSector) return true;
+  return rtSessionMatchesSector({ sector: metricSector }, targetSector, targetSector);
+}
+
+function rtGetMetricEnteredAt(metric) {
+  return rtPickFirstMs(
+    metric?.enteredAt,
+    metric?.entered_at,
+    metric?.entrada,
+    metric?.start,
+    metric?.inicio,
+    metric?.startedAt,
+    metric?.started_at,
+    metric?.createdAt,
+    metric?.created_at
+  );
+}
+
+function rtGetMetricLeftAt(metric) {
+  return rtPickFirstMs(
+    metric?.leftAt,
+    metric?.left_at,
+    metric?.saida,
+    metric?.exitAt,
+    metric?.exit_at,
+    metric?.end,
+    metric?.fim,
+    metric?.endedAt,
+    metric?.ended_at,
+    metric?.updatedAt,
+    metric?.updated_at
+  );
+}
+
+function rtFindStoredMetricForTimeline(row, sector, enteredAt, leftAt, usedIndexes = new Set()) {
+  const storedMetrics = rtArray(row?.ff_sectorMetrics);
+  if (!storedMetrics.length) return null;
+
+  const targetStart = Number(enteredAt || 0);
+  const targetEnd = Number(leftAt || 0);
+
+  let best = null;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  storedMetrics.forEach((metric, idx) => {
+    if (!metric || typeof metric !== 'object') return;
+    if (usedIndexes.has(idx)) return;
+    if (!rtMetricMatchesSector(metric, sector)) return;
+
+    const durations = rtGetStoredMetricDurations(metric);
+    const hasUsefulDuration = durations.totalMs > 0 || durations.workedMs > 0 || durations.pausedMs > 0 || durations.idleMs > 0;
+    if (!hasUsefulDuration) return;
+
+    const mStart = rtGetMetricEnteredAt(metric);
+    const mEnd = rtGetMetricLeftAt(metric);
+
+    let score = 0;
+    if (targetStart && mStart) score += Math.abs(mStart - targetStart);
+    else score += 24 * 60 * 60 * 1000;
+
+    if (targetEnd && mEnd) score += Math.abs(mEnd - targetEnd) * 0.5;
+    else if (targetEnd || mEnd) score += 60 * 60 * 1000;
+
+    // Preferência leve por métricas com trabalhado/pausado real, pois elas batem com os cards do lote.
+    if (durations.workedMs > 0 || durations.pausedMs > 0) score -= 10 * 60 * 1000;
+
+    if (score < bestScore) {
+      bestScore = score;
+      best = { metric, idx, durations };
+    }
+  });
+
+  if (best) usedIndexes.add(best.idx);
+  return best;
+}
+
+function rtComposeDurationsFromSources({ totalCandidateMs, sessionSum, storedDurations }) {
+  const stored = storedDurations || { totalMs: 0, workedMs: 0, pausedMs: 0, idleMs: 0, efficiency: null };
+
+  // Para setores finalizados, ff_sectorMetrics costuma ser a mesma fonte usada nos cards.
+  // Por isso, quando existir total salvo no metric, usamos ele como prioridade.
+  // O cálculo útil por expediente fica como fallback para registros sem metric confiável.
+  let totalMs = stored.totalMs > 0 ? stored.totalMs : Number(totalCandidateMs || 0);
+
+  let workedMs = stored.workedMs > 0 ? stored.workedMs : Number(sessionSum?.workedMs || 0);
+  let pausedMs = stored.pausedMs > 0 ? stored.pausedMs : Number(sessionSum?.pausedMs || 0);
+  let idleMs = stored.idleMs > 0 ? stored.idleMs : 0;
+
+  if (totalMs <= 0 && (workedMs > 0 || pausedMs > 0 || idleMs > 0)) {
+    totalMs = workedMs + pausedMs + idleMs;
+  }
+
+  workedMs = Math.max(0, Math.min(workedMs, totalMs));
+  pausedMs = Math.max(0, Math.min(pausedMs, Math.max(0, totalMs - workedMs)));
+
+  if (idleMs > 0) {
+    idleMs = Math.max(0, Math.min(idleMs, Math.max(0, totalMs - workedMs - pausedMs)));
+  } else {
+    idleMs = Math.max(0, totalMs - workedMs - pausedMs);
+  }
+
+  const efficiency = totalMs > 0
+    ? Math.round((workedMs / totalMs) * 100)
+    : (stored.efficiency != null ? stored.efficiency : 0);
+
+  return { totalMs, workedMs, pausedMs, idleMs, efficiency };
+}
+
 function rtCalculateMetricsFromFallback(row, shiftClosedMap = {}) {
   const now = Date.now();
   const finalSectors = new Set(['pronto', 'entrega', 'entregue', 'finalizado', 'concluido', 'concluído']);
@@ -853,6 +1021,7 @@ function rtCalculateMetricsFromFallback(row, shiftClosedMap = {}) {
     .sort((a, b) => a.at - b.at || a.idx - b.idx);
 
   const metrics = [];
+  const usedStoredMetricIndexes = new Set();
 
   for (let i = 0; i < history.length; i++) {
     const current = history[i];
@@ -879,13 +1048,37 @@ function rtCalculateMetricsFromFallback(row, shiftClosedMap = {}) {
     if (leftAt && leftAt < enteredAt) continue;
 
     const effectiveLeftAt = leftAt || now;
-    const totalMs = rtBusinessDurationMs(enteredAt, effectiveLeftAt, current.sector, shiftClosedMap);
+    const businessTotalMs = rtBusinessDurationMs(enteredAt, effectiveLeftAt, current.sector, shiftClosedMap);
     const sessionSum = rtSumWorkSessionsBySector(row.ff_workSessions, current.sector, enteredAt, effectiveLeftAt, shiftClosedMap);
-    let workedMs = Math.min(sessionSum.workedMs, totalMs);
-    let pausedMs = Math.min(sessionSum.pausedMs, Math.max(0, totalMs - workedMs));
-    const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
-    const efficiency = totalMs > 0 ? Math.round((workedMs / totalMs) * 100) : 0;
-    metrics.push({ sector: current.sector, enteredAt, leftAt: status === 'Em andamento' ? null : leftAt, totalMs, workedMs, pausedMs, idleMs, efficiency, status });
+
+    // Os cards do lote usam dados gravados em ff_sectorMetrics quando existem.
+    // O relatório estava ignorando esses valores quando havia ff_history, por isso trabalhado vinha 0 e tudo virava ocioso.
+    const storedMatch = rtFindStoredMetricForTimeline(
+      row,
+      current.sector,
+      enteredAt,
+      effectiveLeftAt,
+      usedStoredMetricIndexes
+    );
+
+    const composed = rtComposeDurationsFromSources({
+      totalCandidateMs: businessTotalMs,
+      sessionSum,
+      storedDurations: storedMatch?.durations || null
+    });
+
+    metrics.push({
+      sector: current.sector,
+      enteredAt,
+      leftAt: status === 'Em andamento' ? null : leftAt,
+      totalMs: composed.totalMs,
+      workedMs: composed.workedMs,
+      pausedMs: composed.pausedMs,
+      idleMs: composed.idleMs,
+      efficiency: composed.efficiency,
+      status,
+      _preserveStoredMetrics: !!storedMatch
+    });
   }
 
   // Fallback só quando não há histórico confiável.
@@ -994,12 +1187,23 @@ function rtFixMetricsTimeline(metrics, row, shiftClosedMap = {}) {
 
     const effectiveLeftAt = metric.leftAt || now;
     const recalculatedTotal = rtBusinessDurationMs(Number(metric.enteredAt || effectiveLeftAt), effectiveLeftAt, metric.sector, shiftClosedMap);
-    // Sempre usa o total útil recalculado. O valor antigo pode ter contado período fechado.
-    metric.totalMs = recalculatedTotal;
+
+    // Quando a linha veio enriquecida por ff_sectorMetrics, preserva os tempos salvos,
+    // porque eles são a mesma referência usada pelos cards/modal do lote.
+    // Se não houver metric confiável, usa o total útil recalculado por expediente.
+    if (!metric._preserveStoredMetrics) {
+      metric.totalMs = recalculatedTotal;
+    } else if (!Number(metric.totalMs || 0) && recalculatedTotal > 0) {
+      metric.totalMs = recalculatedTotal;
+    }
 
     const sessionSum = rtSumWorkSessionsBySector(row?.ff_workSessions, metric.sector, metric.enteredAt, effectiveLeftAt, shiftClosedMap);
-    if (sessionSum.pausedMs > 0) metric.pausedMs = sessionSum.pausedMs;
-    if (sessionSum.workedMs > 0) metric.workedMs = sessionSum.workedMs;
+    if (!metric._preserveStoredMetrics || Number(metric.pausedMs || 0) <= 0) {
+      if (sessionSum.pausedMs > 0) metric.pausedMs = sessionSum.pausedMs;
+    }
+    if (!metric._preserveStoredMetrics || Number(metric.workedMs || 0) <= 0) {
+      if (sessionSum.workedMs > 0) metric.workedMs = sessionSum.workedMs;
+    }
 
     metric.workedMs = Math.min(Number(metric.workedMs || 0), Number(metric.totalMs || 0));
     metric.pausedMs = Math.min(Number(metric.pausedMs || 0), Math.max(0, Number(metric.totalMs || 0) - metric.workedMs));
