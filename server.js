@@ -530,10 +530,9 @@ function rtSubtractIntervals(baseIntervals, subtractIntervals) {
 // Abriu expediente => continua do ponto congelado.
 // Saiu do setor => finaliza.
 //
-// Além dos eventos reais salvos em ff_sector_shift_events, usamos uma
-// proteção de expediente padrão para impedir contagem corrida durante a noite
-// quando ainda não há histórico completo salvo no banco.
-// Horário padrão em America/Sao_Paulo, sem horário de verão.
+// O cálculo usa SOMENTE eventos reais de abre/fecha expediente.
+// Não existe mais expediente fixo 07:10–17:25 aqui, porque se houver
+// hora extra com expediente aberto o tempo precisa continuar contando.
 // ─────────────────────────────────────────────────────────────
 const RT_WORKDAY_START_MINUTES = 7 * 60 + 10;   // 07:10
 const RT_WORKDAY_END_MINUTES = 17 * 60 + 25;    // 17:25
@@ -622,13 +621,11 @@ function rtGetClosedIntervalsForSector(shiftClosedMap, sector, startMs, endMs) {
   const end = Number(endMs || Date.now());
   if (!start || !end || end <= start) return [];
 
-  // Eventos reais de abre/fecha expediente + fallback de expediente padrão.
-  // Isso impede que o relatório conte a noite inteira quando o lote ficou parado
-  // no setor após o expediente fechado.
-  const standardClosed = rtGetStandardClosedIntervals(start, end);
-  const allClosed = [...eventIntervals, ...standardClosed];
-
-  return rtMergeIntervals(allClosed)
+  // Regra correta FactoryFlow:
+  // conta enquanto o expediente REAL está aberto;
+  // congela somente nos intervalos registrados como fechado.
+  // Não aplica segunda–sexta nem 07:10–17:25 fixo, porque hora extra precisa contar.
+  return rtMergeIntervals(eventIntervals)
     .map(i => ({ start: Math.max(Number(i.start || 0), start), end: Math.min(Number(i.end || 0), end) }))
     .filter(i => i.start > 0 && i.end > i.start);
 }
