@@ -614,28 +614,106 @@ function rtGetShiftKeyForSector(sector) {
   return normalizeShiftSetor(rtNormalizeText(sector || '')) || rtNormalizeText(sector || '');
 }
 
-function rtGetClosedIntervalsForSector(shiftClosedMap, sector, startMs, endMs) {
+function rtGetGlobalShiftKeys() {
+  return ['geral', 'expediente_geral', 'todos', 'all', 'global', 'todos_setores'];
+}
+
+function rtIsGlobalShiftKey(key) {
+  return rtGetGlobalShiftKeys().includes(rtNormalizeText(key));
+}
+
+function rtGetShiftBuckets(shiftMap, sector) {
   const key = rtGetShiftKeyForSector(sector);
-  const eventIntervals = Array.isArray(shiftClosedMap?.[key]) ? shiftClosedMap[key] : [];
+  const keys = [key, ...rtGetGlobalShiftKeys()].filter(Boolean);
+  const closed = [];
+  const open = [];
+
+  for (const k of keys) {
+    if (Array.isArray(shiftMap?.[k])) closed.push(...shiftMap[k]);
+    if (Array.isArray(shiftMap?.__open?.[k])) open.push(...shiftMap.__open[k]);
+  }
+
+  return {
+    key,
+    closed: rtMergeIntervals(closed),
+    open: rtMergeIntervals(open)
+  };
+}
+
+function rtClipIntervals(intervals, startMs, endMs) {
   const start = Number(startMs || 0);
   const end = Number(endMs || Date.now());
   if (!start || !end || end <= start) return [];
 
-  // Regra correta FactoryFlow:
-  // conta enquanto o expediente REAL está aberto;
-  // congela somente nos intervalos registrados como fechado.
-  // Não aplica segunda–sexta nem 07:10–17:25 fixo, porque hora extra precisa contar.
-  return rtMergeIntervals(eventIntervals)
+  return rtMergeIntervals(intervals || [])
     .map(i => ({ start: Math.max(Number(i.start || 0), start), end: Math.min(Number(i.end || 0), end) }))
     .filter(i => i.start > 0 && i.end > i.start);
+}
+
+function rtIntersectIntervals(aIntervals, bIntervals) {
+  const a = rtMergeIntervals(aIntervals || []);
+  const b = rtMergeIntervals(bIntervals || []);
+  const out = [];
+
+  let i = 0;
+  let j = 0;
+  while (i < a.length && j < b.length) {
+    const start = Math.max(a[i].start, b[j].start);
+    const end = Math.min(a[i].end, b[j].end);
+    if (end > start) out.push({ start, end });
+
+    if (a[i].end < b[j].end) i++;
+    else j++;
+  }
+
+  return rtMergeIntervals(out);
+}
+
+function rtGetClosedIntervalsForSector(shiftClosedMap, sector, startMs, endMs) {
+  const buckets = rtGetShiftBuckets(shiftClosedMap, sector);
+  return rtClipIntervals(buckets.closed, startMs, endMs);
+}
+
+function rtGetOpenIntervalsForSector(shiftClosedMap, sector, startMs, endMs) {
+  const buckets = rtGetShiftBuckets(shiftClosedMap, sector);
+  return rtClipIntervals(buckets.open, startMs, endMs);
 }
 
 function rtBusinessIntervals(startMs, endMs, sector, shiftClosedMap = {}) {
   const start = Number(startMs || 0);
   const end = Number(endMs || Date.now());
   if (!start || !end || end <= start) return [];
-  const base = [{ start, end }];
+
+  let base = [{ start, end }];
+  const buckets = rtGetShiftBuckets(shiftClosedMap, sector);
+  const sectorKey = buckets.key;
+
+  // Regra correta FactoryFlow:
+  // tempo conta somente enquanto o expediente está ABERTO.
+  // Quando existe histórico de abertura, usamos esses intervalos como fonte principal.
+  // Se não existir histórico de abertura para aquele setor, mantemos compatibilidade:
+  // contamos o intervalo e descontamos apenas períodos fechados registrados.
+  const globalOpen = [];
+  for (const gk of rtGetGlobalShiftKeys()) {
+    if (Array.isArray(shiftClosedMap?.__open?.[gk])) globalOpen.push(...shiftClosedMap.__open[gk]);
+  }
+  const sectorOpen = Array.isArray(shiftClosedMap?.__open?.[sectorKey]) ? shiftClosedMap.__open[sectorKey] : [];
+
+  const clippedGlobalOpen = rtClipIntervals(globalOpen, start, end);
+  const clippedSectorOpen = rtClipIntervals(sectorOpen, start, end);
+
+  if (clippedGlobalOpen.length) {
+    base = rtIntersectIntervals(base, clippedGlobalOpen);
+  }
+
+  if (clippedSectorOpen.length) {
+    base = rtIntersectIntervals(base, clippedSectorOpen);
+  }
+
   const closed = rtGetClosedIntervalsForSector(shiftClosedMap, sector, start, end);
+
+  // Mesmo com intervalos abertos, descontamos fechamentos explícitos como proteção contra
+  // eventos duplicados/incompletos.
   return rtSubtractIntervals(base, closed);
 }
 
@@ -645,31 +723,107 @@ function rtBusinessDurationMs(startMs, endMs, sector, shiftClosedMap = {}) {
 
 async function rtLoadShiftClosedIntervals() {
   const map = {};
+  map.__open = {};
+  map.__state = {};
+
+  const ensureBucket = (key) => {
+    if (!key) return;
+    if (!map[key]) map[key] = [];
+    if (!map.__open[key]) map.__open[key] = [];
+    if (!map.__state[key]) {
+      map.__state[key] = {
+        hasEvents: false,
+        lastEventAt: null,
+        lastEventType: null,
+        isOpen: null,
+        openedAt: null,
+        closedAt: null
+      };
+    }
+  };
+
+  const addClosed = (key, start, end) => {
+    if (!key || !start || !end || end <= start) return;
+    ensureBucket(key);
+    map[key].push({ start, end });
+  };
+
+  const addOpen = (key, start, end) => {
+    if (!key || !start || !end || end <= start) return;
+    ensureBucket(key);
+    map.__open[key].push({ start, end });
+  };
+
   try {
     await ensureSectorShiftTable();
     await ensureSectorShiftEventsTable();
 
     const [events] = await dbPool.query(`
-      SELECT setor, event_type, created_at
+      SELECT id, setor, event_type, created_at
       FROM ff_sector_shift_events
       ORDER BY setor ASC, created_at ASC, id ASC
     `);
 
-    const openCloseBySetor = new Map();
+    const bySetor = new Map();
     for (const ev of events || []) {
       const key = rtGetShiftKeyForSector(ev.setor);
-      const type = rtNormalizeText(ev.event_type);
+      const typeRaw = rtNormalizeText(ev.event_type);
       const at = rtToMs(ev.created_at);
       if (!key || !at) continue;
-      if (!map[key]) map[key] = [];
+      ensureBucket(key);
 
-      if (type.includes('fech') || type === 'closed' || type === 'close') {
-        openCloseBySetor.set(key, at);
-      } else if (type.includes('aber') || type === 'open' || type === 'opened') {
-        const start = openCloseBySetor.get(key);
-        if (start && at > start) map[key].push({ start, end: at });
-        openCloseBySetor.delete(key);
+      const isClose = typeRaw.includes('fech') || typeRaw === 'closed' || typeRaw === 'close' || typeRaw === 'encerrado' || typeRaw === 'encerrar';
+      const isOpen = typeRaw.includes('aber') || typeRaw === 'open' || typeRaw === 'opened' || typeRaw === 'iniciado' || typeRaw === 'iniciar';
+      if (!isClose && !isOpen) continue;
+
+      if (!bySetor.has(key)) bySetor.set(key, []);
+      bySetor.get(key).push({ at, type: isOpen ? 'open' : 'close' });
+
+      map.__state[key].hasEvents = true;
+      map.__state[key].lastEventAt = at;
+      map.__state[key].lastEventType = isOpen ? 'open' : 'close';
+    }
+
+    const now = Date.now();
+
+    for (const [key, list] of bySetor.entries()) {
+      const sorted = list.sort((a, b) => a.at - b.at);
+      let openStart = null;
+
+      for (const ev of sorted) {
+        if (ev.type === 'open') {
+          if (!openStart) openStart = ev.at;
+          continue;
+        }
+
+        if (ev.type === 'close') {
+          // Se o primeiro evento conhecido é fechamento, assumimos que antes disso estava aberto.
+          // Isso preserva histórico antigo e evita zerar períodos antes do primeiro fechamento registrado.
+          if (!openStart) {
+            addOpen(key, 1, ev.at);
+          } else if (ev.at > openStart) {
+            addOpen(key, openStart, ev.at);
+          }
+          addClosed(key, ev.at, now); // será recortado/mesclado depois e fechado por próxima abertura.
+          openStart = null;
+        }
       }
+
+      if (openStart) {
+        addOpen(key, openStart, now);
+      }
+
+      // Monta intervalos fechados entre "fechar" e a próxima "abertura" real.
+      let closedStart = null;
+      for (const ev of sorted) {
+        if (ev.type === 'close') {
+          closedStart = ev.at;
+        } else if (ev.type === 'open' && closedStart) {
+          if (ev.at > closedStart) addClosed(key, closedStart, ev.at);
+          closedStart = null;
+        }
+      }
+      if (closedStart) addClosed(key, closedStart, now);
     }
 
     const [shifts] = await dbPool.query(`
@@ -677,27 +831,53 @@ async function rtLoadShiftClosedIntervals() {
       FROM ff_sector_shifts
     `);
 
-    const now = Date.now();
     for (const row of shifts || []) {
       const key = rtGetShiftKeyForSector(row.setor);
       if (!key) continue;
-      if (!map[key]) map[key] = [];
+      ensureBucket(key);
+
       const isOpen = Number(row.expediente_aberto || 0) === 1;
       const closedAt = rtToMs(row.finalizado_em);
       const openedAt = rtToMs(row.iniciado_em);
 
-      // Se está fechado agora, congela desde finalizado_em até agora.
-      if (!isOpen && closedAt) {
-        map[key].push({ start: closedAt, end: now });
+      map.__state[key].isOpen = isOpen;
+      map.__state[key].openedAt = openedAt || map.__state[key].openedAt;
+      map.__state[key].closedAt = closedAt || map.__state[key].closedAt;
+
+      if (isOpen && openedAt) {
+        addOpen(key, openedAt, now);
+
+        // Proteção para quando a base antiga só tem o estado atual aberto,
+        // mas não tem evento histórico de "fechado -> aberto".
+        // Nesse caso, antes do iniciado_em atual o expediente deve ser tratado como fechado
+        // para lotes que atravessaram a noite/fim de semana.
+        const hasClosedEndingAtOpen = (map[key] || []).some(i => Math.abs(Number(i.end || 0) - openedAt) <= 2 * 60 * 1000);
+        const hasEventHistory = !!map.__state[key].hasEvents;
+        if (!hasEventHistory && openedAt) {
+          addClosed(key, 1, openedAt);
+        } else if (hasEventHistory && !hasClosedEndingAtOpen && map.__state[key].lastEventType === 'open') {
+          // Se o último evento conhecido é abertura e não encontramos o fechamento anterior,
+          // fecha pelo menos o período imediatamente anterior à abertura atual.
+          addClosed(key, Math.max(1, openedAt - 18 * 60 * 60 * 1000), openedAt);
+        }
       }
 
-      // Proteção para base antiga: se há finalizado_em e depois iniciado_em, adiciona o intervalo fechado.
+      if (!isOpen && closedAt) {
+        addClosed(key, closedAt, now);
+      }
+
       if (isOpen && closedAt && openedAt && openedAt > closedAt) {
-        map[key].push({ start: closedAt, end: openedAt });
+        addClosed(key, closedAt, openedAt);
       }
     }
 
-    for (const key of Object.keys(map)) map[key] = rtMergeIntervals(map[key]);
+    for (const key of Object.keys(map)) {
+      if (key.startsWith('__')) continue;
+      map[key] = rtMergeIntervals(map[key]);
+    }
+    for (const key of Object.keys(map.__open)) {
+      map.__open[key] = rtMergeIntervals(map.__open[key]);
+    }
   } catch (err) {
     console.warn('[relatorio-tempos] não foi possível carregar histórico de expediente:', err.message);
   }
@@ -1252,7 +1432,11 @@ function rtObservationKeys() {
   return [
     'observacoes', 'observacao', 'observação', 'obs', 'observation', 'observations',
     'note', 'notes', 'comentario', 'comentário', 'comentarios', 'comentários',
-    'descricao', 'descrição', 'description', 'detalhes', 'details'
+    'descricao', 'descrição', 'description', 'detalhes', 'details',
+    'observacaoAvanco', 'observacao_avanco', 'obsAvanco', 'obs_avanco',
+    'observacaoSetor', 'observacao_setor', 'comentarioSetor', 'comentario_setor',
+    'movementObservation', 'advanceObservation', 'advanceNote', 'sectorNote',
+    'textoObservacao', 'texto_observacao'
   ];
 }
 
@@ -3403,7 +3587,8 @@ app.get('/api/lote/:op', async (req, res) => {
           ff_sectorEnteredAt: lote.ff_sectorEnteredAt || null,
           ff_workSessions: lote.ff_workSessions || null,
           ff_expedientePausedStatus: lote.ff_expedientePausedStatus || null,
-          ff_history: lote.ff_history || null
+          ff_history: lote.ff_history || null,
+          ff_sectorMetrics: lote.ff_sectorMetrics || null
         }
       });
     }
