@@ -975,10 +975,13 @@ function rtFindStoredMetricForTimeline(row, sector, enteredAt, leftAt, usedIndex
 function rtComposeDurationsFromSources({ totalCandidateMs, sessionSum, storedDurations }) {
   const stored = storedDurations || { totalMs: 0, workedMs: 0, pausedMs: 0, idleMs: 0, efficiency: null };
 
-  // Para setores finalizados, ff_sectorMetrics costuma ser a mesma fonte usada nos cards.
-  // Por isso, quando existir total salvo no metric, usamos ele como prioridade.
-  // O cálculo útil por expediente fica como fallback para registros sem metric confiável.
-  let totalMs = stored.totalMs > 0 ? stored.totalMs : Number(totalCandidateMs || 0);
+  // Regra correta: o total no setor deve ser o tempo útil calculado pelos
+  // eventos reais de abrir/fechar expediente. Não priorize totalMs antigo de
+  // ff_sectorMetrics, porque ele pode ter sido gravado corrido enquanto o
+  // expediente estava fechado. O metric salvo continua servindo para
+  // trabalhado/pausado quando existir.
+  let totalMs = Number(totalCandidateMs || 0);
+  if (totalMs <= 0 && stored.totalMs > 0) totalMs = stored.totalMs;
 
   let workedMs = stored.workedMs > 0 ? stored.workedMs : Number(sessionSum?.workedMs || 0);
   let pausedMs = stored.pausedMs > 0 ? stored.pausedMs : Number(sessionSum?.pausedMs || 0);
@@ -1185,12 +1188,10 @@ function rtFixMetricsTimeline(metrics, row, shiftClosedMap = {}) {
     const effectiveLeftAt = metric.leftAt || now;
     const recalculatedTotal = rtBusinessDurationMs(Number(metric.enteredAt || effectiveLeftAt), effectiveLeftAt, metric.sector, shiftClosedMap);
 
-    // Quando a linha veio enriquecida por ff_sectorMetrics, preserva os tempos salvos,
-    // porque eles são a mesma referência usada pelos cards/modal do lote.
-    // Se não houver metric confiável, usa o total útil recalculado por expediente.
-    if (!metric._preserveStoredMetrics) {
-      metric.totalMs = recalculatedTotal;
-    } else if (!Number(metric.totalMs || 0) && recalculatedTotal > 0) {
+    // Sempre usa o total útil recalculado pelos eventos reais de expediente.
+    // Mesmo quando há ff_sectorMetrics, o total salvo pode estar corrido; então
+    // preservamos apenas trabalhado/pausado quando forem úteis.
+    if (recalculatedTotal > 0 || !Number(metric.totalMs || 0)) {
       metric.totalMs = recalculatedTotal;
     }
 
@@ -1209,6 +1210,95 @@ function rtFixMetricsTimeline(metrics, row, shiftClosedMap = {}) {
   }
 
   return sorted;
+}
+
+
+function rtFirstTextValue(obj, keys) {
+  if (!obj || typeof obj !== 'object') return '';
+  for (const key of keys || []) {
+    const value = obj?.[key];
+    if (value == null) continue;
+    if (Array.isArray(value)) {
+      const txt = value.map(v => typeof v === 'object' ? rtFirstTextValue(v, keys) : String(v || '').trim()).filter(Boolean).join(' | ');
+      if (txt) return txt;
+      continue;
+    }
+    if (typeof value === 'object') {
+      const nested = rtFirstTextValue(value, keys);
+      if (nested) return nested;
+      continue;
+    }
+    const txt = String(value || '').trim();
+    if (txt && txt !== '-' && txt !== '–') return txt;
+  }
+  return '';
+}
+
+function rtUniqueTextJoin(values) {
+  const seen = new Set();
+  const out = [];
+  for (const value of values || []) {
+    const txt = String(value || '').trim();
+    if (!txt || txt === '-' || txt === '–') continue;
+    const key = txt.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push(txt);
+  }
+  return out.join(' | ');
+}
+
+function rtObservationKeys() {
+  return [
+    'observacoes', 'observacao', 'observação', 'obs', 'observation', 'observations',
+    'note', 'notes', 'comentario', 'comentário', 'comentarios', 'comentários',
+    'descricao', 'descrição', 'description', 'detalhes', 'details'
+  ];
+}
+
+function rtPauseReasonKeys() {
+  return [
+    'pauseReason', 'pause_reason', 'motivoPausa', 'motivo_pausa', 'motivo_pausado',
+    'motivoPausado', 'reason', 'pausaMotivo', 'pausa_motivo'
+  ];
+}
+
+function rtCollectTempoRowTexts(row, metric, type = 'obs') {
+  const keys = type === 'pause' ? rtPauseReasonKeys() : rtObservationKeys();
+  const values = [];
+  const sectorNorm = rtNormalizeText(metric?.sector || '');
+  const start = Number(metric?.enteredAt || 0);
+  const end = Number(metric?.leftAt || Date.now());
+  const tolerance = 2 * 60 * 1000;
+
+  // Observações digitadas ao avançar normalmente ficam no evento de histórico
+  // que tem o timestamp da saída do setor anterior. Por isso aceitamos eventos
+  // no intervalo da linha e também eventos exatamente próximos da saída.
+  for (const ev of rtArray(row?.ff_history)) {
+    if (!ev || typeof ev !== 'object') continue;
+    const txt = rtFirstTextValue(ev, keys);
+    if (!txt) continue;
+    const evTime = rtGetHistoryEventTime(ev) || rtPickFirstMs(ev?.timestamp, ev?.createdAt, ev?.created_at, ev?.updatedAt, ev?.updated_at);
+    const evSector = rtNormalizeText(rtExtractSectorFromHistoryEvent(ev));
+    const sameSector = !sectorNorm || !evSector || evSector === sectorNorm || rtSessionMatchesSector({ sector: evSector }, sectorNorm, sectorNorm);
+    const insideWindow = !start || !evTime || (evTime >= start - tolerance && evTime <= end + tolerance);
+    const closeToExit = end && evTime && Math.abs(evTime - end) <= tolerance;
+    if (sameSector || insideWindow || closeToExit) values.push(txt);
+  }
+
+  // Motivo de pausa costuma ficar em ff_workSessions. Também aceitamos obs ali,
+  // caso o frontend tenha gravado observação junto com a sessão.
+  for (const session of rtArray(row?.ff_workSessions)) {
+    if (!session || typeof session !== 'object') continue;
+    const txt = rtFirstTextValue(session, keys);
+    if (!txt) continue;
+    if (!rtSessionMatchesSector(session, metric?.sector || '', metric?.sector || '')) continue;
+    const { start: sStart, end: sEnd } = rtGetSessionRange(session);
+    const overlaps = !start || !sStart || rtOverlapMs(sStart, sEnd || end || Date.now(), start, end || Date.now()) > 0;
+    if (overlaps) values.push(txt);
+  }
+
+  return rtUniqueTextJoin(values);
 }
 
 function rtBuildTempoRowsFromLot(row, setorFiltro = '', shiftClosedMap = {}) {
@@ -1246,6 +1336,9 @@ function rtBuildTempoRowsFromLot(row, setorFiltro = '', shiftClosedMap = {}) {
       status: metric.status || (metric.leftAt ? 'Finalizado' : 'Em andamento'),
       status_atual_lote: row.status || '',
       setor_atual_lote: row.setor_atual || '',
+      observacoes: rtCollectTempoRowTexts(row, metric, 'obs'),
+      pauseReason: rtCollectTempoRowTexts(row, metric, 'pause'),
+      motivo_pausa: rtCollectTempoRowTexts(row, metric, 'pause'),
       id_lote: row.id || null
     }));
 }
