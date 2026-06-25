@@ -1762,7 +1762,7 @@ app.get('/', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.4.0-expediente-setor',
+    version: '2.4.1-expediente-reprocessamento',
     timestamp: new Date().toISOString(),
     endpoints: [
       'GET /health',
@@ -1779,6 +1779,7 @@ app.get('/', (req, res) => {
       'GET /api/producao',
       'GET /api/producao/ativos',
       'GET /api/producao/relatorio-tempos',
+      'POST /api/admin/reprocessar-tempos',
       'GET /api/producao/:id',
       'POST /api/producao/manual',
       'POST /api/lotes',
@@ -1816,7 +1817,7 @@ app.get('/health', (req, res) => {
   res.json({
     ok: true,
     service: 'FactoryFlow + CQVision API',
-    version: '2.4.0-expediente-setor',
+    version: '2.4.1-expediente-reprocessamento',
     timestamp: new Date().toISOString(),
     sync: getSyncStats(),
   });
@@ -4010,7 +4011,7 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
       return sendError(res, 404, 'Tabela producao_lotes não encontrada');
     }
 
-    const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 500), 1), 2000);
+    const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 500), 1), 10000);
     const offset = toPositiveInt(req.query.offset, 0);
 
     const codigoRaw = String(req.query.codigos || req.query.codigo || '').trim();
@@ -4132,6 +4133,309 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
     return sendError(res, 500, 'Erro ao gerar relatório de tempos', err.message);
   }
 });
+
+
+// ===================================================
+// PATCH INDUSCOLOR – REPROCESSAMENTO SEGURO DOS TEMPOS ANTIGOS
+// Cole este bloco no server.js, de preferência logo depois da rota:
+// GET /api/producao/relatorio-tempos
+//
+// Objetivo:
+// - Recalcular ff_sectorMetrics a partir de ff_history + ff_sector_shift_events.
+// - Corrigir métricas antigas que ficaram contando com expediente fechado.
+// - Rodar primeiro em DRY RUN, sem alterar banco.
+// - Quando aplicar, cria backup em ff_backup_reprocessamento_tempos.
+//
+// Rotas:
+// POST /api/admin/reprocessar-tempos?dryRun=1
+// POST /api/admin/reprocessar-tempos
+//
+// Body exemplos:
+// { "op": "088079", "apply": false }
+// { "days": 120, "limit": 5000, "apply": true }
+// ===================================================
+
+function ffAdminParseBool(value) {
+  return value === true || value === 1 || value === '1' || String(value || '').toLowerCase() === 'true' || String(value || '').toLowerCase() === 'sim';
+}
+
+function ffAdminNumber(value, fallback, max = 10000) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.min(Math.floor(n), max);
+}
+
+function ffAdminSafeJsonString(value) {
+  try {
+    return JSON.stringify(value ?? []);
+  } catch (_) {
+    return '[]';
+  }
+}
+
+function ffAdminTempoRowsToSectorMetrics(rows) {
+  return (Array.isArray(rows) ? rows : [])
+    .filter(row => row && row.setor)
+    .filter(row => !['pronto', 'entrega', 'entregue', 'finalizado', 'cancelado', 'rejeitado'].includes(rtNormalizeText(row.setor)))
+    .map(row => {
+      const totalMs = Math.max(0, Number(row.totalMs || 0));
+      const workedMs = Math.min(Math.max(0, Number(row.workedMs || 0)), totalMs);
+      const pausedMs = Math.min(Math.max(0, Number(row.pausedMs || 0)), Math.max(0, totalMs - workedMs));
+      const idleMs = Math.max(0, totalMs - workedMs - pausedMs);
+
+      return {
+        sector: row.setor,
+        sectorLabel: row.setor_nome || rtDisplaySector(row.setor),
+        enteredAt: row.enteredAt || null,
+        leftAt: row.leftAt || null,
+        totalMs,
+        workedMs,
+        pausedMs,
+        idleMs,
+        efficiency: totalMs > 0 ? Math.min(100, Math.round((workedMs / totalMs) * 100)) : 0,
+        status: row.status || (row.leftAt ? 'Finalizado' : 'Em andamento'),
+        source: 'reprocessado_backend_ff_history_expediente',
+        recalculatedAt: Date.now()
+      };
+    });
+}
+
+async function ffAdminEnsureTempoBackupTable() {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_backup_reprocessamento_tempos (
+      backup_id INT AUTO_INCREMENT PRIMARY KEY,
+      batch_id VARCHAR(80) NOT NULL,
+      backup_em DATETIME DEFAULT CURRENT_TIMESTAMP,
+      lote_id INT NULL,
+      op VARCHAR(40) NULL,
+      numero_pedido VARCHAR(40) NULL,
+      setor_atual VARCHAR(80) NULL,
+      status VARCHAR(80) NULL,
+      old_ff_sectorMetrics LONGTEXT NULL,
+      old_ff_workSessions LONGTEXT NULL,
+      old_ff_history LONGTEXT NULL,
+      old_ff_sectorEnteredAt BIGINT NULL,
+      old_updated_at DATETIME NULL,
+      INDEX idx_ff_bkp_reproc_batch (batch_id),
+      INDEX idx_ff_bkp_reproc_op (op),
+      INDEX idx_ff_bkp_reproc_lote (lote_id)
+    )
+  `);
+}
+
+app.post('/api/admin/reprocessar-tempos', async (req, res) => {
+  try {
+    await ensureProductionLotesTimeColumns();
+    await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
+
+    const apply = ffAdminParseBool(req.body?.apply) || ffAdminParseBool(req.query?.apply);
+    const dryRun = !apply || ffAdminParseBool(req.query?.dryRun);
+
+    const op = String(req.body?.op || req.query?.op || '').trim();
+    const pedido = String(req.body?.pedido || req.query?.pedido || '').trim();
+    const setor = String(req.body?.setor || req.query?.setor || '').trim();
+
+    const days = ffAdminNumber(req.body?.days || req.query?.days, 180, 3650);
+    const limit = ffAdminNumber(req.body?.limit || req.query?.limit, 5000, 20000);
+
+    const conditions = [];
+    const params = [];
+
+    // Só reprocessa lotes que têm histórico. Sem ff_history confiável,
+    // não existe linha do tempo suficiente para recalcular com segurança.
+    conditions.push(`ff_history IS NOT NULL`);
+    conditions.push(`TRIM(ff_history) <> ''`);
+    conditions.push(`TRIM(ff_history) <> '[]'`);
+
+    if (op) {
+      conditions.push(`TRIM(op) = TRIM(?)`);
+      params.push(op);
+    }
+
+    if (pedido) {
+      conditions.push(`TRIM(numero_pedido) = TRIM(?)`);
+      params.push(pedido);
+    }
+
+    if (setor) {
+      conditions.push(`(setor_atual LIKE ? OR ff_history LIKE ? OR ff_sectorMetrics LIKE ?)`);
+      params.push(`%${setor}%`, `%${setor}%`, `%${setor}%`);
+    }
+
+    if (!op && !pedido) {
+      conditions.push(`COALESCE(updated_at, data_criacao) >= DATE_SUB(NOW(), INTERVAL ? DAY)`);
+      params.push(days);
+    }
+
+    const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
+
+    const [lotes] = await dbPool.query(
+      `
+        SELECT
+          id,
+          op,
+          numero_pedido,
+          produto_codigo,
+          produto_nome,
+          cliente_nome,
+          quantidade,
+          linha_produto,
+          status,
+          setor_atual,
+          ff_lotStatus,
+          ff_sectorEnteredAt,
+          ff_workSessions,
+          ff_history,
+          ff_sectorMetrics,
+          data_criacao,
+          updated_at
+        FROM producao_lotes
+        ${where}
+        ORDER BY COALESCE(updated_at, data_criacao) DESC, id DESC
+        LIMIT ?
+      `,
+      [...params, limit]
+    );
+
+    const shiftClosedMap = await rtLoadShiftClosedIntervals();
+    const batchId = `reproc_${new Date().toISOString().replace(/[-:.TZ]/g, '').slice(0, 14)}_${Math.random().toString(16).slice(2, 8)}`;
+
+    if (apply) {
+      await ffAdminEnsureTempoBackupTable();
+    }
+
+    const report = [];
+    let updated = 0;
+    let skipped = 0;
+    let errors = 0;
+
+    for (const lote of lotes || []) {
+      try {
+        const rows = rtBuildTempoRowsFromLot(lote, '', shiftClosedMap);
+        const metrics = ffAdminTempoRowsToSectorMetrics(rows);
+
+        if (!metrics.length) {
+          skipped++;
+          report.push({
+            id: lote.id,
+            op: lote.op,
+            status: 'ignorado',
+            motivo: 'Sem métricas recalculáveis a partir do histórico'
+          });
+          continue;
+        }
+
+        const oldMetricsRaw = lote.ff_sectorMetrics || '[]';
+        const newMetricsRaw = ffAdminSafeJsonString(metrics);
+
+        const oldTotal = rtArray(oldMetricsRaw).reduce((sum, m) => sum + Math.max(0, Number(m?.totalMs || m?.total || 0)), 0);
+        const newTotal = metrics.reduce((sum, m) => sum + Math.max(0, Number(m.totalMs || 0)), 0);
+        const diffMs = newTotal - oldTotal;
+
+        report.push({
+          id: lote.id,
+          op: lote.op,
+          pedido: lote.numero_pedido,
+          setor_atual: lote.setor_atual,
+          linhas: metrics.length,
+          total_antigo_ms: oldTotal,
+          total_novo_ms: newTotal,
+          diferenca_ms: diffMs,
+          total_antigo_horas: Number((oldTotal / 3600000).toFixed(2)),
+          total_novo_horas: Number((newTotal / 3600000).toFixed(2)),
+          diferenca_horas: Number((diffMs / 3600000).toFixed(2)),
+          status: dryRun ? 'simulado' : 'atualizado'
+        });
+
+        if (!dryRun) {
+          await dbPool.query(
+            `
+              INSERT INTO ff_backup_reprocessamento_tempos
+                (
+                  batch_id,
+                  lote_id,
+                  op,
+                  numero_pedido,
+                  setor_atual,
+                  status,
+                  old_ff_sectorMetrics,
+                  old_ff_workSessions,
+                  old_ff_history,
+                  old_ff_sectorEnteredAt,
+                  old_updated_at
+                )
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            `,
+            [
+              batchId,
+              lote.id,
+              lote.op || null,
+              lote.numero_pedido || null,
+              lote.setor_atual || null,
+              lote.status || null,
+              lote.ff_sectorMetrics || null,
+              lote.ff_workSessions || null,
+              lote.ff_history || null,
+              lote.ff_sectorEnteredAt || null,
+              lote.updated_at || null
+            ]
+          );
+
+          await dbPool.query(
+            `
+              UPDATE producao_lotes
+              SET ff_sectorMetrics = ?
+              WHERE id = ?
+              LIMIT 1
+            `,
+            [newMetricsRaw, lote.id]
+          );
+
+          updated++;
+        }
+
+      } catch (err) {
+        errors++;
+        report.push({
+          id: lote.id,
+          op: lote.op,
+          status: 'erro',
+          erro: err.message
+        });
+      }
+    }
+
+    return res.json({
+      ok: true,
+      modo: dryRun ? 'DRY_RUN_SEM_ALTERAR_BANCO' : 'APLICADO_NO_BANCO',
+      batchId: dryRun ? null : batchId,
+      filtros: {
+        op: op || null,
+        pedido: pedido || null,
+        setor: setor || null,
+        days: (!op && !pedido) ? days : null,
+        limit
+      },
+      totais: {
+        encontrados: lotes.length,
+        atualizados: dryRun ? 0 : updated,
+        simulados: dryRun ? report.filter(r => r.status === 'simulado').length : 0,
+        ignorados: skipped,
+        erros: errors
+      },
+      amostra: report.slice(0, 50),
+      aviso: dryRun
+        ? 'Nada foi alterado. Para aplicar, envie apply:true no body ou ?apply=1.'
+        : 'Banco atualizado. Backup salvo em ff_backup_reprocessamento_tempos usando o batchId retornado.'
+    });
+
+  } catch (err) {
+    console.error('POST /api/admin/reprocessar-tempos erro:', err);
+    return sendError(res, 500, 'Erro ao reprocessar tempos antigos', err.message);
+  }
+});
+
 
 
 app.get('/api/producao', async (req, res) => {
