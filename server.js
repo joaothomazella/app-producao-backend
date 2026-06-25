@@ -4521,6 +4521,20 @@ app.post('/api/expediente/toggle', async (req, res) => {
 
     if (!setor) return sendError(res, 400, 'Setor obrigatório');
 
+    // Proteção contra clique duplicado/tela desatualizada:
+    // se o setor já está no estado solicitado, não grava novo evento e não reseta iniciado_em/finalizado_em.
+    const [beforeRows] = await dbPool.query(
+      `SELECT * FROM ff_sector_shifts WHERE setor = ? LIMIT 1`,
+      [setor]
+    );
+
+    const previous = beforeRows[0] || null;
+    const wasOpen = previous ? Number(previous.expediente_aberto || 0) === 1 : null;
+
+    if (previous && wasOpen === aberto) {
+      return res.json({ ok: true, unchanged: true, data: previous });
+    }
+
     if (aberto) {
       await dbPool.query(
         `
@@ -4546,7 +4560,6 @@ app.post('/api/expediente/toggle', async (req, res) => {
       );
     }
 
-    await ensureSectorShiftEventsTable();
     await dbPool.query(
       `INSERT INTO ff_sector_shift_events (setor, event_type, created_by) VALUES (?, ?, ?)`,
       [setor, aberto ? 'aberto' : 'fechado', req.user?.name || req.user?.email || req.authType || null]
@@ -4557,7 +4570,7 @@ app.post('/api/expediente/toggle', async (req, res) => {
       [setor]
     );
 
-    res.json({ ok: true, data: rows[0] });
+    res.json({ ok: true, unchanged: false, data: rows[0] });
   } catch (err) {
     console.error('POST /api/expediente/toggle erro:', err.message);
     sendError(res, 500, 'Erro ao alterar expediente do setor', err.message);
