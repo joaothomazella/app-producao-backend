@@ -555,6 +555,44 @@ function rtSaoPauloLocalToMs(year, month, day, hour = 0, minute = 0, second = 0)
   return Date.UTC(year, month - 1, day, hour, minute, second, 0) - RT_SAO_PAULO_OFFSET_MINUTES * 60000;
 }
 
+// Datas DATETIME do MySQL do expediente são gravadas como horário local do Brasil.
+// Ex.: "2026-06-25 07:07:26" significa 07:07 em Rio Claro/SP, não 07:07 UTC.
+// O mysql2/JSON pode transformar isso em Date/ISO com "Z", criando deslocamento de 3h.
+// Para eventos de expediente, convertemos os componentes da data como America/Sao_Paulo.
+function rtShiftDateTimeToMs(value) {
+  if (value == null || value === '') return null;
+
+  if (typeof value === 'number' && Number.isFinite(value)) {
+    return value < 10000000000 ? Math.round(value * 1000) : Math.round(value);
+  }
+
+  if (value instanceof Date) {
+    const y = value.getUTCFullYear();
+    const mo = value.getUTCMonth() + 1;
+    const d = value.getUTCDate();
+    const h = value.getUTCHours();
+    const mi = value.getUTCMinutes();
+    const s = value.getUTCSeconds();
+    return rtSaoPauloLocalToMs(y, mo, d, h, mi, s);
+  }
+
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+
+  if (/^\d+$/.test(raw)) {
+    const n = Number(raw);
+    return n < 10000000000 ? Math.round(n * 1000) : Math.round(n);
+  }
+
+  const match = raw.match(/^(\d{4})-(\d{2})-(\d{2})[ T](\d{2}):(\d{2})(?::(\d{2}))?/);
+  if (match) {
+    const [, y, mo, d, h, mi, s] = match;
+    return rtSaoPauloLocalToMs(Number(y), Number(mo), Number(d), Number(h), Number(mi), Number(s || 0));
+  }
+
+  return rtToMs(value);
+}
+
 function rtAddDaysSaoPauloYmd(year, month, day, addDays) {
   const base = Date.UTC(year, month - 1, day + addDays, 12, 0, 0, 0);
   const d = new Date(base);
@@ -793,7 +831,7 @@ async function rtLoadShiftClosedIntervals() {
     for (const ev of events || []) {
       const key = rtGetShiftKeyForSector(ev.setor);
       const typeRaw = rtNormalizeText(ev.event_type);
-      const at = rtToMs(ev.created_at);
+      const at = rtShiftDateTimeToMs(ev.created_at);
       if (!key || !at) continue;
       ensureBucket(key);
 
@@ -862,8 +900,8 @@ async function rtLoadShiftClosedIntervals() {
       ensureBucket(key);
 
       const isOpen = Number(row.expediente_aberto || 0) === 1;
-      const closedAt = rtToMs(row.finalizado_em);
-      const openedAt = rtToMs(row.iniciado_em);
+      const closedAt = rtShiftDateTimeToMs(row.finalizado_em);
+      const openedAt = rtShiftDateTimeToMs(row.iniciado_em);
 
       map.__state[key].isOpen = isOpen;
       map.__state[key].openedAt = openedAt || map.__state[key].openedAt;
