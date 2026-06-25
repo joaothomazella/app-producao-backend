@@ -690,14 +690,33 @@ function rtBusinessIntervals(startMs, endMs, sector, shiftClosedMap = {}) {
 
   // Regra correta FactoryFlow:
   // tempo conta somente enquanto o expediente está ABERTO.
-  // Quando existe histórico de abertura, usamos esses intervalos como fonte principal.
-  // Se não existir histórico de abertura para aquele setor, mantemos compatibilidade:
-  // contamos o intervalo e descontamos apenas períodos fechados registrados.
+  //
+  // Correção importante:
+  // Quando existe evento antigo de "fechado" sem o par de "aberto" no histórico,
+  // o intervalo fechado pode ficar como fechado -> agora e apagar até o expediente atual.
+  // Porém a tabela ff_sector_shifts é o estado vivo do sistema.
+  // Se ela diz que o setor está aberto desde iniciado_em, esse intervalo aberto atual
+  // precisa vencer o fechamento antigo.
+  const state = shiftClosedMap?.__state?.[sectorKey] || {};
+  const currentOpenStart = Number(state?.isOpen && state?.openedAt ? state.openedAt : 0);
+  const currentOpenIntervals = currentOpenStart && end > currentOpenStart
+    ? rtClipIntervals([{ start: currentOpenStart, end }], start, end)
+    : [];
+
   const globalOpen = [];
   for (const gk of rtGetGlobalShiftKeys()) {
     if (Array.isArray(shiftClosedMap?.__open?.[gk])) globalOpen.push(...shiftClosedMap.__open[gk]);
   }
-  const sectorOpen = Array.isArray(shiftClosedMap?.__open?.[sectorKey]) ? shiftClosedMap.__open[sectorKey] : [];
+
+  const sectorOpen = Array.isArray(shiftClosedMap?.__open?.[sectorKey])
+    ? [...shiftClosedMap.__open[sectorKey]]
+    : [];
+
+  // Garante que o expediente aberto atual entre no cálculo, mesmo que o evento
+  // histórico de abertura não exista ou tenha sido gravado duplicado/incompleto.
+  if (currentOpenIntervals.length) {
+    sectorOpen.push(...currentOpenIntervals);
+  }
 
   const clippedGlobalOpen = rtClipIntervals(globalOpen, start, end);
   const clippedSectorOpen = rtClipIntervals(sectorOpen, start, end);
@@ -710,7 +729,13 @@ function rtBusinessIntervals(startMs, endMs, sector, shiftClosedMap = {}) {
     base = rtIntersectIntervals(base, clippedSectorOpen);
   }
 
-  const closed = rtGetClosedIntervalsForSector(shiftClosedMap, sector, start, end);
+  let closed = rtGetClosedIntervalsForSector(shiftClosedMap, sector, start, end);
+
+  // Se o setor está aberto agora, não deixa um fechamento antigo cobrir o período
+  // após a abertura atual.
+  if (currentOpenIntervals.length) {
+    closed = rtSubtractIntervals(closed, currentOpenIntervals);
+  }
 
   // Mesmo com intervalos abertos, descontamos fechamentos explícitos como proteção contra
   // eventos duplicados/incompletos.
