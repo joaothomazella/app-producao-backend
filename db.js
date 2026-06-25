@@ -1,13 +1,24 @@
 'use strict';
 
+require('dotenv').config();
+
 const mysql = require('mysql2/promise');
 
+const requiredEnvVars = ['DB_HOST', 'DB_USER', 'DB_PASSWORD', 'DB_NAME'];
+const missingEnvVars = requiredEnvVars.filter(name => !process.env[name]);
+
+if (missingEnvVars.length) {
+  throw new Error(
+    `Configuração de banco incompleta. Defina as variáveis de ambiente: ${missingEnvVars.join(', ')}`
+  );
+}
+
 const dbPool = mysql.createPool({
-  host: 'db.induscolor.com.br',
-  port: 3306,
-  database: 'induscolor_sistema',
-  user: 'induscolor',
-  password: 'Adxcb$332#21xVc%',
+  host: process.env.DB_HOST,
+  port: Number(process.env.DB_PORT) || 3306,
+  database: process.env.DB_NAME,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
   waitForConnections: true,
   connectionLimit: 10,
   queueLimit: 0,

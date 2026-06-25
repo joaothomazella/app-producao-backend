@@ -1699,7 +1699,7 @@ const API_TOKEN = (process.env.FACTORYFLOW_API_TOKEN || process.env.API_TOKEN ||
 const JWT_SECRET = (
   process.env.JWT_SECRET ||
   process.env.FACTORYFLOW_JWT_SECRET ||
-  'INDUSCOLORSECURE9xA82kLmP2026'
+  ''
 ).trim();
 
 function base64UrlDecode(value) {
@@ -7250,6 +7250,9 @@ app.use((req, res) => {
       console.log('   GET  /api/sync/status');
       console.log('   POST /api/sync/run\n');
       console.log(API_TOKEN ? '🔐 Segurança: rotas /api protegidas por token.\n' : '⚠️  Segurança: FACTORYFLOW_API_TOKEN não configurado. Rotas /api retornarão 503.\n');
+      if (!JWT_SECRET) {
+        console.log('⚠️  Segurança: JWT_SECRET não configurado. Logins via JWT central serão rejeitados até a variável ser definida.\n');
+      }
     });
 
     startSync();
