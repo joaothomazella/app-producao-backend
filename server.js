@@ -1581,6 +1581,9 @@ function rtBuildTempoRowsFromLot(row, setorFiltro = '', shiftClosedMap = {}) {
       idleMs: Math.max(0, Number(metric.idleMs || 0)),
       efficiency: Math.max(0, Math.min(100, Number(metric.efficiency || 0))),
       status: metric.status || (metric.leftAt ? 'Finalizado' : 'Em andamento'),
+      // ff_lot_status é a fonte de verdade do estado operacional do lote (FactoryFlow);
+      // status_atual_lote (coluna legada `status`) é mantido apenas como fallback.
+      ff_lot_status: row.ff_lotStatus || '',
       status_atual_lote: row.status || '',
       setor_atual_lote: row.setor_atual || '',
       observacoes: rtCollectTempoRowTexts(row, metric, 'obs'),
