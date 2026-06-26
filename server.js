@@ -604,6 +604,22 @@ function rtShiftDateTimeToMs(value) {
   return rtToMs(value);
 }
 
+// Corrige iniciado_em/finalizado_em/atualizado_em de uma linha de ff_sector_shifts antes de
+// devolver ao frontend: troca o Date "mal rotulado" do mysql2 (ver rtShiftDateTimeToMs acima)
+// por uma string ISO com o instante UTC correto, para o card de expediente não exibir hora
+// 3h adiantada/atrasada (mesmo bug que já tinha sido corrigido no cálculo do relatório de tempos).
+function ffFixShiftRowDates(row) {
+  if (!row) return row;
+  const fixed = { ...row };
+  ['iniciado_em', 'finalizado_em', 'atualizado_em'].forEach((field) => {
+    if (fixed[field] != null) {
+      const ms = rtShiftDateTimeToMs(fixed[field]);
+      fixed[field] = Number.isFinite(ms) ? new Date(ms).toISOString() : fixed[field];
+    }
+  });
+  return fixed;
+}
+
 function rtAddDaysSaoPauloYmd(year, month, day, addDays) {
   const base = Date.UTC(year, month - 1, day + addDays, 12, 0, 0, 0);
   const d = new Date(base);
@@ -4890,7 +4906,7 @@ app.get('/api/expediente', async (req, res) => {
       ORDER BY setor ASC
     `);
 
-    res.json({ ok: true, total: rows.length, data: rows });
+    res.json({ ok: true, total: rows.length, data: rows.map(ffFixShiftRowDates) });
   } catch (err) {
     console.error('GET /api/expediente erro:', err.message);
     sendError(res, 500, 'Erro ao buscar expediente dos setores', err.message);
@@ -4922,10 +4938,10 @@ app.get('/api/expediente/:setor', async (req, res) => {
         [setor]
       );
 
-      return res.json({ ok: true, data: created[0] });
+      return res.json({ ok: true, data: ffFixShiftRowDates(created[0]) });
     }
 
-    res.json({ ok: true, data: rows[0] });
+    res.json({ ok: true, data: ffFixShiftRowDates(rows[0]) });
   } catch (err) {
     console.error('GET /api/expediente/:setor erro:', err.message);
     sendError(res, 500, 'Erro ao buscar expediente do setor', err.message);
@@ -4960,7 +4976,7 @@ app.post('/api/expediente/toggle', async (req, res) => {
     const wasOpen = previous ? Number(previous.expediente_aberto || 0) === 1 : null;
 
     if (previous && wasOpen === aberto) {
-      return res.json({ ok: true, unchanged: true, data: previous });
+      return res.json({ ok: true, unchanged: true, data: ffFixShiftRowDates(previous) });
     }
 
     if (aberto) {
@@ -4998,7 +5014,7 @@ app.post('/api/expediente/toggle', async (req, res) => {
       [setor]
     );
 
-    res.json({ ok: true, unchanged: false, data: rows[0] });
+    res.json({ ok: true, unchanged: false, data: ffFixShiftRowDates(rows[0]) });
     } finally {
       ffExpedienteToggleLocks.delete(setor);
     }
