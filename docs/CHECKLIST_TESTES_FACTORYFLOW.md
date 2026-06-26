@@ -60,14 +60,14 @@
 - [ ] Combinação de múltiplos filtros ao mesmo tempo retorna resultado coerente (interseção, não união).
 - [ ] Limpar todos os filtros volta a exibir o conjunto padrão de dados (últimos 30 dias, conforme regra do backend quando nenhum filtro de usuário está ativo).
 
-## 6. Testes de exportação Excel/PDF
+## 6. Testes de exportação Excel/PDF/CSV
 
-- [ ] Exportar para **Excel** gera um arquivo válido (via SheetJS) com os dados atualmente filtrados na tela.
-- [ ] Se a exportação Excel falhar, confirmar que o fallback CSV é acionado e gera um arquivo utilizável.
+- [ ] Exportar para **Excel** gera um arquivo `.xls` válido (tabela HTML reconhecida pelo Excel, sem depender de biblioteca externa) com os dados atualmente filtrados na tela. Não há fallback para Excel — esse formato não depende de biblioteca externa, então não falha por biblioteca ausente.
 - [ ] Exportar para **PDF** gera um arquivo válido (via jsPDF + autoTable) com os dados atualmente filtrados na tela.
-- [ ] Se a exportação PDF falhar, confirmar que o fallback `window.print()` é acionado.
-- [ ] Confirmar que a coluna "Status" **não** aparece nas exportações (Excel/PDF), conforme comportamento documentado em `docs/FACTORYFLOW_REGRAS.md`, seção 13.
-- [ ] Exportar com filtros aplicados gera arquivo apenas com os dados filtrados (não a base completa).
+- [ ] Se jsPDF/autoTable não estiverem carregados, ou se a geração do PDF falhar por qualquer motivo, confirmar que um **CSV simples** é baixado automaticamente como fallback (`exportRelatorioTemposCSV`, `frontend/js/relatorio-tempos.js`) — não existe fallback `window.print()`.
+- [ ] O CSV de fallback contém as colunas: OP, Pedido, Cliente, Código do Produto, Produto, Setor, Status, Entrada, Saída, Tempo Total, Trabalhado, Pausado, Ocioso, Eficiência (%), Observações/Motivo da Pausa.
+- [ ] Confirmar que a coluna "Status" **não** aparece nas exportações em Excel/PDF (conforme `docs/FACTORYFLOW_REGRAS.md`, seção 13), mas **aparece** no CSV de fallback (comportamento intencional, diferente do Excel/PDF).
+- [ ] Exportar com filtros aplicados gera arquivo (Excel, PDF ou CSV) apenas com os dados filtrados (não a base completa).
 
 ## 7. Testes de programação/entregas
 
@@ -119,7 +119,8 @@
 - [ ] **`/api/producao/ativos` retornando erro 5xx ou vazio quando deveria haver lotes** — quebra o carregamento do Kanban para todos os usuários.
 - [ ] **Quantidade de lotes ativos no Kanban mudando drasticamente sem explicação operacional** (ex.: de ~200 lotes ativos para 0 ou para um número muito maior) — sinal de que uma mudança de lógica de status/setor alterou o filtro de "ativos" (ver riscos documentados em `backend/docs/DECISAO_STATUS_FACTORYFLOW.md`, seção 6).
 - [ ] **Relatório de Tempos retornando valores de tempo negativos, ou trabalhado+pausado+ocioso não somando o total** — indica regressão no cálculo (`rtCalculateMetricsFromFallback`/`rtBuildTempoRowsFromLot`).
-- [ ] **Exportação Excel/PDF falhando para todos os usuários** (não um caso isolado de navegador) — sinal de regressão no carregamento das bibliotecas (SheetJS/jsPDF) após deploy do frontend.
+- [ ] **Exportação Excel falhando para todos os usuários** (não um caso isolado de navegador) — Excel não depende de biblioteca externa (é tabela HTML/.xls), então uma falha generalizada indica regressão no próprio código de `relatorio-tempos.js`, não em biblioteca externa.
+- [ ] **Exportação PDF falhando para todos os usuários, sem o fallback CSV ser baixado** — sinal de regressão na carga do jsPDF/autoTable *e* no fallback (`exportRelatorioTemposCSV`) após deploy do frontend.
 - [ ] **Erros recorrentes de timeout/erro de rede entre frontend (Cloudflare Pages) e backend (Railway)** — pode indicar que o backend está fora do ar, sobrecarregado, ou que a URL configurada no frontend está incorreta.
 - [ ] **Avanço de setor movendo lotes para o setor errado** para qualquer tipo de produto (tinta, base, amostra, verniz, endurecedor, diluente) — indica regressão grave nas regras de fluxo (`getNextSectorOptions`/`confirmSendToSector`).
 - [ ] **Erros no console indicando exceções não tratadas (`Uncaught TypeError`, etc.) em qualquer tela principal durante uso normal** (não apenas em casos extremos/edge cases).

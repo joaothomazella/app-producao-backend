@@ -197,7 +197,7 @@ Fonte: `frontend/js/relatorio-tempos.js`, `backend/server.js` (funções com pre
 - Transições de histórico com `saída ≤ entrada` são **descartadas silenciosamente** (não geram erro, apenas `console.warn`); linhas com timestamp impossível exibem aviso em vez de data corrompida.
 - **Tempo total por setor é calculado pelos eventos reais de abertura/fechamento de expediente** (ver seção 14) — não existe mais expediente fixo fixo 07:10–17:25 cravado no cálculo; o sistema desconta os períodos em que o expediente do setor estava fechado.
 - Filtros disponíveis: código do produto (multi-prefixo separado por vírgula), nome do produto, OP/Lote, número de pedido, cliente, data inicial/final, setor.
-- Exportações: Excel via SheetJS (fallback CSV) e PDF via jsPDF+autoTable (fallback `window.print()`); a exportação em Excel/PDF **não inclui a coluna "Status"**.
+- Exportações: Excel via tabela HTML reconhecida pelo Excel (`.xls`, sem dependência externa, sem fallback necessário) e PDF via jsPDF+autoTable; a exportação em Excel/PDF **não inclui a coluna "Status"**. Se jsPDF/autoTable não estiverem disponíveis ou a geração do PDF falhar, o frontend baixa um **CSV simples** como fallback (`exportRelatorioTemposCSV`, `frontend/js/relatorio-tempos.js`) — esse CSV de fallback **inclui a coluna "Status"** (não é o mesmo formato do Excel/PDF). Não existe fallback `window.print()`.
 - A tabela exibe uma linha de **Totais Gerais** no rodapé, respeitando os filtros ativos.
 
 ---
