@@ -568,12 +568,23 @@ function rtShiftDateTimeToMs(value) {
   }
 
   if (value instanceof Date) {
-    // O driver mysql2 (config padrão timezone:'local') já converte o DATETIME gravado em
-    // horário do Brasil para o instante UTC correto usando o fuso do processo Node (confirmado
-    // via RT_DEBUG na OP 088088: reaplicar o deslocamento de São Paulo aqui deslocava os eventos
-    // de expediente em +3h, fechando o setor laboratorio por cima da sessão real da Erica).
-    // value.getTime() já é o instante correto; não reconverter.
-    return value.getTime();
+    // O mysql2 (config padrão timezone:'local') constrói este Date chamando o construtor
+    // local do JS com os números literais do DATETIME (que são horário do Brasil, sem fuso
+    // gravado). value.getTime() só dá o instante certo se o timezone do processo Node for
+    // America/Sao_Paulo (verdade no Windows local, falso no Railway, que roda em UTC) —
+    // por isso local e produção calculavam closedIntervals diferentes para a mesma OP 088088.
+    // Os getters LOCAIS (getFullYear/getHours, sem "UTC") são simétricos ao construtor local
+    // usado pelo mysql2: devolvem de volta os mesmos números literais do banco independente
+    // de qual seja o fuso do processo. Por isso extraímos os literais assim e convertemos
+    // nós mesmos como America/Sao_Paulo, em vez de confiar em value.getTime().
+    return rtSaoPauloLocalToMs(
+      value.getFullYear(),
+      value.getMonth() + 1,
+      value.getDate(),
+      value.getHours(),
+      value.getMinutes(),
+      value.getSeconds()
+    );
   }
 
   const raw = String(value || '').trim();
