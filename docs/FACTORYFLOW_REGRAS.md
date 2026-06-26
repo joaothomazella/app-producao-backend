@@ -213,6 +213,7 @@ Fonte: `frontend/js/data.js` (funções `iniciarExpedienteSetor`, `finalizarExpe
 - Ao **reabrir** o expediente, lotes que estavam `working` antes do fechamento recebem uma nova sessão de trabalho a partir do horário de abertura; o tempo "parado" entre o fechamento e a reabertura é somado ao `sectorEnteredAt` do lote (não conta como tempo no setor).
 - Existem chaves de expediente "globais" (`geral`, `expediente_geral`, `todos`, `all`, `global`, `todos_setores`) que, se usadas, afetam o cálculo de todos os setores simultaneamente (`rtGetGlobalShiftKeys`, `backend/server.js`).
 - Há um sistema de **alertas automáticos de expediente** (`frontend/js/expediente-alerts.js`) com horários configurados: 07:10 abrir, 11:25 aviso de almoço (só se aberto), 13:05 reabrir (só se fechado), 17:25 encerrar (16:25 sextas, 15:20 última sexta do mês). Cada alerta aparece no máximo 1x por dia por usuário (controle via `localStorage`).
+- **Cada evento `close` em `ff_sector_shift_events` deve gerar um intervalo fechado limitado pela próxima `open` do mesmo setor normalizado** (`rtPairSectorCloseToNextOpen`, `backend/server.js`); só fecha até "agora" quando não há abertura posterior registrada. Estender um fechamento até "agora" incondicionalmente faz o `rtMergeIntervals` colapsar vários ciclos abre/fecha num único bloco fechado gigante, zerando tempo útil de janelas que na verdade tiveram expediente aberto (bug confirmado e corrigido na auditoria da OP 088088/lote 755, setor `laboratorio`).
 
 ---
 

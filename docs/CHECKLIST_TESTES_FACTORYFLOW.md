@@ -47,6 +47,7 @@
 - [ ] Badge de status do lote no relatório reflete `ff_lotStatus` (campo `ff_lot_status` retornado pelo backend) e não o `status` legado quando ambos estão presentes e divergem — checar especificamente um lote onde os dois campos sejam diferentes (ver `backend/docs/DECISAO_STATUS_FACTORYFLOW.md`).
 - [ ] Linha de "Totais Gerais" no rodapé soma corretamente os valores filtrados na tela.
 - [ ] Trocar o expediente de um setor (abrir/fechar) e confirmar que o tempo "ocioso" do período fechado é descontado corretamente no relatório.
+- [ ] **Eventos `close` de expediente devem fechar só até a próxima `open` do mesmo setor normalizado, nunca até "agora" indefinidamente** (`rtPairSectorCloseToNextOpen`, `backend/server.js`). Testar com a OP 088088 (lote 755, setor `laboratorio`): antes da correção, `GET /api/producao/relatorio-tempos?op=088088&limit=100` retornava `totalMs=0`/`workedMs=0` para a janela `enteredAt=1782331726066`→`leftAt=1782392033653`, mesmo havendo expediente aberto e uma sessão de trabalho real (Erica, ~38min) dentro da janela. Depois da correção, a linha deve refletir total útil próximo de 3,1h e `workedMs` próximo de 38min (`pausedMs=0`, `idleMs` como resíduo).
 
 ## 5. Testes de filtros (OP, pedido, cliente, produto, setor)
 
