@@ -4866,6 +4866,12 @@ app.patch('/api/producao/:id', async (req, res) => {
 // FACTORYFLOW - EXPEDIENTE POR SETOR
 // =========================
 
+// Trava por setor em memória: evita que dois toggles quase simultâneos (duplo clique,
+// duas abas, F5+clique) leiam o mesmo estado "anterior" antes de qualquer um gravar,
+// o que duplicaria eventos em ff_sector_shift_events. Sem isso, a checagem unchanged/wasOpen
+// abaixo tem uma janela de corrida porque as queries não estão em transação.
+const ffExpedienteToggleLocks = new Set();
+
 app.get('/api/expediente', async (req, res) => {
   try {
     await ensureSectorShiftTable();
@@ -4937,6 +4943,12 @@ app.post('/api/expediente/toggle', async (req, res) => {
 
     if (!setor) return sendError(res, 400, 'Setor obrigatório');
 
+    if (ffExpedienteToggleLocks.has(setor)) {
+      return sendError(res, 409, 'Já existe uma alteração de expediente em andamento para este setor. Aguarde um instante.');
+    }
+    ffExpedienteToggleLocks.add(setor);
+
+    try {
     // Proteção contra clique duplicado/tela desatualizada:
     // se o setor já está no estado solicitado, não grava novo evento e não reseta iniciado_em/finalizado_em.
     const [beforeRows] = await dbPool.query(
@@ -4987,6 +4999,9 @@ app.post('/api/expediente/toggle', async (req, res) => {
     );
 
     res.json({ ok: true, unchanged: false, data: rows[0] });
+    } finally {
+      ffExpedienteToggleLocks.delete(setor);
+    }
   } catch (err) {
     console.error('POST /api/expediente/toggle erro:', err.message);
     sendError(res, 500, 'Erro ao alterar expediente do setor', err.message);
