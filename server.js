@@ -4593,8 +4593,14 @@ app.get('/api/producao', async (req, res) => {
     }
 
     if (setor) {
-      conditions.push('setor_atual = ?');
-      params.push(setor);
+      const setores = String(setor).split(',').map((s) => s.trim()).filter(Boolean);
+      if (setores.length > 1) {
+        conditions.push(`setor_atual IN (${setores.map(() => '?').join(',')})`);
+        params.push(...setores);
+      } else {
+        conditions.push('setor_atual = ?');
+        params.push(setores[0] || setor);
+      }
     }
 
     if (search) {
