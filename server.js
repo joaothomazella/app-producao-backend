@@ -2596,6 +2596,35 @@ app.post('/api/login', async (req, res) => {
     );
 
     if (!rows.length) {
+      // Fallback: tenta ff_users (usuários criados diretamente no FactoryFlow)
+      const hasFF = await tableExists('ff_users');
+      if (hasFF) {
+        const [ffRows] = await dbPool.query(
+          `SELECT * FROM ff_users WHERE LOWER(TRIM(COALESCE(login,''))) = ? AND COALESCE(active,'true') NOT IN ('false','0','inativo') LIMIT 1`,
+          [usuario]
+        );
+        if (ffRows.length) {
+          const ffUser = ffRows[0];
+          const ffOk = await verifyFactoryFlowPassword(senha, String(ffUser.password || ''));
+          if (!ffOk) {
+            return sendError(res, 401, 'Usuário ou senha incorretos');
+          }
+          const ffPayload = {
+            id: String(ffUser.id || ''),
+            usuario: ffUser.login || usuario,
+            login:   ffUser.login || usuario,
+            username: ffUser.login || usuario,
+            nome: ffUser.name || ffUser.login || usuario,
+            name: ffUser.name || ffUser.login || usuario,
+            role: ffUser.role || 'viewer',
+            acesso_factoryflow: ffUser.role || 'manager',
+            apps: ['factoryflow'],
+          };
+          const ffToken = signFactoryFlowJwt(ffPayload);
+          console.log('✅ Login ff_users OK:', usuario, '| role:', ffPayload.role);
+          return res.json({ ok: true, token: ffToken, user: ffPayload });
+        }
+      }
       console.warn('⚠️ Login recusado: usuário não encontrado:', usuario);
       return sendError(res, 401, 'Usuário ou senha incorretos');
     }
