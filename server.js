@@ -3849,9 +3849,11 @@ app.get('/api/producao/ativos', async (req, res) => {
         LEFT JOIN cli_clientes c
           ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(pl.cliente_codigo) AS UNSIGNED)
         WHERE
-          LOWER(COALESCE(pl.status, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
-          AND LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado', 'rejeitado')
-        ORDER BY pl.id DESC
+          LOWER(COALESCE(pl.status, '')) NOT IN ('entregue', 'finalizado', 'cancelado')
+          AND LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado')
+        ORDER BY
+          (LOWER(COALESCE(pl.status,'')) = 'rejeitado' OR LOWER(COALESCE(pl.ff_lotStatus,'')) = 'rejected') ASC,
+          pl.id DESC
         LIMIT ?
       `,
       [limit]
