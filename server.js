@@ -4176,7 +4176,9 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
     const codigoRaw = String(req.query.codigos || req.query.codigo || '').trim();
     const codigos = codigoRaw.split(/[;,\n\s]+/).map(v => v.trim()).filter(Boolean);
     const produto = String(req.query.produto || '').trim();
-    const op = String(req.query.op || req.query.lote || '').trim();
+    const opRaw = String(req.query.op || req.query.lote || '').trim();
+    const ops = opRaw ? opRaw.split(/[;,]+/).map(v => v.trim()).filter(Boolean) : [];
+    const op = ops.join(';'); // mantido para compatibilidade com hasAnyUserFilter
     const pedido = String(req.query.pedido || req.query.numero_pedido || '').trim();
     const cliente = String(req.query.cliente || '').trim();
     const setor = String(req.query.setor || '').trim();
@@ -4191,7 +4193,13 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
       for (const codigo of codigos) params.push(`${codigo}%`);
     }
     if (produto) { conditions.push('produto_nome LIKE ?'); params.push(`%${produto}%`); }
-    if (op) { conditions.push('TRIM(op) = TRIM(?)'); params.push(op); }
+    if (ops.length === 1) {
+      conditions.push('TRIM(op) = TRIM(?)');
+      params.push(ops[0]);
+    } else if (ops.length > 1) {
+      conditions.push(`(${ops.map(() => 'TRIM(op) = TRIM(?)').join(' OR ')})`);
+      for (const o of ops) params.push(o);
+    }
     if (pedido) { conditions.push('TRIM(numero_pedido) = TRIM(?)'); params.push(pedido); }
     if (cliente) { conditions.push('cliente_nome LIKE ?'); params.push(`%${cliente}%`); }
     if (setor) {
