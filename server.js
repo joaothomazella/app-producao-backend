@@ -3,6 +3,7 @@
 require('dotenv').config();
 
 const crypto = require('crypto');
+const webpush = require('web-push');
 const express = require('express');
 const cors = require('cors');
 const { testConnection, dbPool } = require('./db');
@@ -243,6 +244,10 @@ async function ensureProductionLotesTimeColumns() {
     {
       name: 'ff_sectorMetrics',
       sql: `ALTER TABLE producao_lotes ADD COLUMN ff_sectorMetrics LONGTEXT NULL`
+    },
+    {
+      name: 'ff_comments',
+      sql: `ALTER TABLE producao_lotes ADD COLUMN ff_comments LONGTEXT NULL`
     }
   ];
 
@@ -252,6 +257,98 @@ async function ensureProductionLotesTimeColumns() {
       await dbPool.query(col.sql);
       console.log(`✅ Coluna producao_lotes.${col.name} criada.`);
     }
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
+// PUSH NOTIFICATIONS – VAPID + tabelas
+// ─────────────────────────────────────────────────────────────
+let _vapidPublicKey  = '';
+let _vapidPrivateKey = '';
+
+async function ensurePushTables() {
+  // Tabela de chaves VAPID persistidas
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_vapid_keys (
+      id INT PRIMARY KEY DEFAULT 1,
+      public_key  VARCHAR(255) NOT NULL,
+      private_key VARCHAR(255) NOT NULL
+    )
+  `);
+
+  // Tabela de subscriptions por usuário
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_push_subscriptions (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      user_id    VARCHAR(100) NOT NULL,
+      user_name  VARCHAR(200),
+      sector     VARCHAR(100),
+      endpoint   TEXT NOT NULL,
+      p256dh     TEXT NOT NULL,
+      auth       TEXT NOT NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_endpoint (endpoint(200))
+    )
+  `);
+}
+
+async function initVapidKeys() {
+  await ensurePushTables();
+
+  // Usa chaves do .env se existirem
+  if (process.env.VAPID_PUBLIC_KEY && process.env.VAPID_PRIVATE_KEY) {
+    _vapidPublicKey  = process.env.VAPID_PUBLIC_KEY;
+    _vapidPrivateKey = process.env.VAPID_PRIVATE_KEY;
+  } else {
+    // Busca no banco
+    const [rows] = await dbPool.query('SELECT public_key, private_key FROM ff_vapid_keys WHERE id = 1');
+    if (rows.length) {
+      _vapidPublicKey  = rows[0].public_key;
+      _vapidPrivateKey = rows[0].private_key;
+    } else {
+      // Gera e salva
+      const keys = webpush.generateVAPIDKeys();
+      _vapidPublicKey  = keys.publicKey;
+      _vapidPrivateKey = keys.privateKey;
+      await dbPool.query(
+        'INSERT INTO ff_vapid_keys (id, public_key, private_key) VALUES (1, ?, ?)',
+        [_vapidPublicKey, _vapidPrivateKey]
+      );
+      console.log('🔑 VAPID keys geradas e salvas no banco.');
+    }
+  }
+
+  webpush.setVapidDetails(
+    'mailto:contato@induscolor.com.br',
+    _vapidPublicKey,
+    _vapidPrivateKey
+  );
+  console.log(`🔔 Web Push pronto. Public key: ${_vapidPublicKey.slice(0,20)}...`);
+}
+
+async function sendPushToSector(sector, title, body, data = {}) {
+  if (!_vapidPublicKey) return;
+  try {
+    const [subs] = await dbPool.query(
+      'SELECT endpoint, p256dh, auth FROM ff_push_subscriptions WHERE sector = ?',
+      [sector]
+    );
+    const payload = JSON.stringify({ title, body, data });
+    for (const sub of subs) {
+      try {
+        await webpush.sendNotification(
+          { endpoint: sub.endpoint, keys: { p256dh: sub.p256dh, auth: sub.auth } },
+          payload
+        );
+      } catch (e) {
+        // subscription expirada → remove
+        if (e.statusCode === 410 || e.statusCode === 404) {
+          await dbPool.query('DELETE FROM ff_push_subscriptions WHERE endpoint = ?', [sub.endpoint]);
+        }
+      }
+    }
+  } catch (err) {
+    console.error('[push] sendPushToSector erro:', err.message);
   }
 }
 
@@ -4881,7 +4978,8 @@ app.patch('/api/producao/:id', async (req, res) => {
       'ff_workSessions',
       'ff_expedientePausedStatus',
       'ff_history',
-      'ff_sectorMetrics'
+      'ff_sectorMetrics',
+      'ff_comments'
     ];
 
     const body = req.body || {};
@@ -4916,12 +5014,68 @@ app.patch('/api/producao/:id', async (req, res) => {
     );
 
     res.json({ ok: true, data: rows[0] });
+
+    // Push notification quando lote avança de setor
+    if (body.setor_atual && rows[0]) {
+      const lot = rows[0];
+      const novoSetor = String(body.setor_atual || '').trim();
+      const prioridade = String(lot.prioridade || 'normal').toLowerCase();
+      const isUrgente = prioridade === 'urgente' || prioridade === 'urgent' || prioridade === 'sameday';
+      if (novoSetor && novoSetor !== 'pronto' && novoSetor !== 'entregue') {
+        const icon = isUrgente ? '🚨' : '📦';
+        const prioLabel = prioridade === 'sameday' ? 'MESMO DIA' : prioridade === 'urgente' ? 'URGENTE' : 'normal';
+        setImmediate(() => sendPushToSector(
+          novoSetor,
+          `${icon} Novo lote no setor`,
+          `OP #${lot.op || lot.id} – ${lot.cliente_nome || 'Cliente'} | ${lot.produto_nome || ''} | Prioridade: ${prioLabel}`,
+          { lotId: lot.id, op: lot.op, sector: novoSetor, priority: prioridade }
+        ));
+      }
+    }
   } catch (err) {
     console.error('PATCH /api/producao/:id erro:', err.message);
     sendError(res, 500, 'Erro ao atualizar lote', err.message);
   }
 });
 
+// ─────────────────────────────────────────────────────────────
+// PUSH – endpoints de subscribe/unsubscribe e VAPID public key
+// ─────────────────────────────────────────────────────────────
+app.get('/api/push/vapid-public-key', (_req, res) => {
+  if (!_vapidPublicKey) return sendError(res, 503, 'Push não inicializado');
+  res.json({ ok: true, publicKey: _vapidPublicKey });
+});
+
+app.post('/api/push/subscribe', async (req, res) => {
+  try {
+    const { subscription, userId, userName, sector } = req.body || {};
+    if (!subscription?.endpoint || !subscription?.keys?.p256dh || !subscription?.keys?.auth) {
+      return sendError(res, 400, 'Subscription inválida');
+    }
+    await ensurePushTables();
+    await dbPool.query(
+      `INSERT INTO ff_push_subscriptions (user_id, user_name, sector, endpoint, p256dh, auth)
+       VALUES (?, ?, ?, ?, ?, ?)
+       ON DUPLICATE KEY UPDATE user_id=VALUES(user_id), user_name=VALUES(user_name), sector=VALUES(sector), p256dh=VALUES(p256dh), auth=VALUES(auth)`,
+      [String(userId||''), String(userName||''), String(sector||''), subscription.endpoint, subscription.keys.p256dh, subscription.keys.auth]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    console.error('[push] subscribe erro:', err.message);
+    sendError(res, 500, 'Erro ao salvar subscription', err.message);
+  }
+});
+
+app.delete('/api/push/subscribe', async (req, res) => {
+  try {
+    const { endpoint } = req.body || {};
+    if (!endpoint) return sendError(res, 400, 'endpoint obrigatório');
+    await dbPool.query('DELETE FROM ff_push_subscriptions WHERE endpoint = ?', [endpoint]);
+    res.json({ ok: true });
+  } catch (err) {
+    sendError(res, 500, 'Erro ao remover subscription', err.message);
+  }
+});
 
 // =========================
 // FACTORYFLOW - EXPEDIENTE POR SETOR
@@ -7332,6 +7486,7 @@ app.use((req, res) => {
     await ensureSectorShiftEventsTable();
     await ensurePedidoDatasTable();
     await ensureProductionLotesTimeColumns();
+    await initVapidKeys().catch(e => console.warn('[push] initVapidKeys:', e.message));
 
     app.listen(PORT, () => {
       console.log(`🚀 API rodando em http://localhost:${PORT}\n`);
