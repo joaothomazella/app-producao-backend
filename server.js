@@ -7447,12 +7447,12 @@ async function deleteGenericTableRow(req, res) {
   }
 }
 
-app.get('/tables/:table', listGenericTable);
-app.get('/tables/:table/:id', getGenericTableRow);
-app.post('/tables/:table', createGenericTableRow);
-app.put('/tables/:table/:id', updateGenericTableRow);
-app.patch('/tables/:table/:id', updateGenericTableRow);
-app.delete('/tables/:table/:id', deleteGenericTableRow);
+app.get('/tables/:table', requireApiToken, listGenericTable);
+app.get('/tables/:table/:id', requireApiToken, getGenericTableRow);
+app.post('/tables/:table', requireApiToken, createGenericTableRow);
+app.put('/tables/:table/:id', requireApiToken, updateGenericTableRow);
+app.patch('/tables/:table/:id', requireApiToken, updateGenericTableRow);
+app.delete('/tables/:table/:id', requireApiToken, deleteGenericTableRow);
 
 // Alias com /api/tables caso algum frontend esteja configurado assim.
 app.get('/api/tables/:table', listGenericTable);
