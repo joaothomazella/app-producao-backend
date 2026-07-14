@@ -7234,6 +7234,31 @@ const FF_TABLES = {
       )
     `,
     columns: ['id','name','login','password','role','active']
+  },
+  cq_lines: {
+    createSql: `
+      CREATE TABLE IF NOT EXISTS cq_lines (
+        id VARCHAR(100) PRIMARY KEY,
+        name VARCHAR(150) NULL,
+        active VARCHAR(20) DEFAULT 'true',
+        createdAt BIGINT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `,
+    columns: ['id','name','active','createdAt']
+  },
+  cq_reasons: {
+    createSql: `
+      CREATE TABLE IF NOT EXISTS cq_reasons (
+        id VARCHAR(100) PRIMARY KEY,
+        name VARCHAR(150) NULL,
+        category VARCHAR(100) NULL,
+        active VARCHAR(20) DEFAULT 'true',
+        createdAt BIGINT NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      )
+    `,
+    columns: ['id','name','category','active','createdAt']
   }
 };
 
