@@ -175,6 +175,15 @@ async function ensureProductionLotesManualColumns() {
     `);
     console.log('✅ Coluna producao_lotes.linha_produto criada.');
   }
+
+  const hasPrevisaoEntrega = await columnExists('producao_lotes', 'previsao_entrega');
+  if (!hasPrevisaoEntrega) {
+    await dbPool.query(`
+      ALTER TABLE producao_lotes
+      ADD COLUMN previsao_entrega DATE NULL
+    `);
+    console.log('✅ Coluna producao_lotes.previsao_entrega criada.');
+  }
 }
 
 
@@ -3720,6 +3729,7 @@ async function criarLoteManual(req, res) {
     const tipoLote = normalizeProductionTipo(body.tipo_lote || body.tipo || body.productType || body.product_type || body.linha_produto || body.linha, produtoNome, produtoCodigo);
     const linhaProduto = String(body.linha_produto || body.linha || body.product_type || tipoLote).trim();
     const prioridade = String(body.prioridade || body.urgencia || 'normal').trim();
+    const previsaoEntrega = String(body.previsao_entrega || body.deliveryDate || body.data_entrega || body.pits_previsao || '').trim() || null;
     const setorAtual = String(body.setor_atual || body.setor || 'moagem').trim();
     const status = String(body.status || 'aguardando').trim();
     const quantidade = resolveQuantidadeKg(
@@ -3772,8 +3782,9 @@ async function criarLoteManual(req, res) {
           liberado_pcp,
           setor_atual,
           origem,
-          linha_produto
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?)
+          linha_produto,
+          previsao_entrega
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?, ?)
       `,
       [
         numeroPedido || `MANUAL-${op}`,
@@ -3792,7 +3803,8 @@ async function criarLoteManual(req, res) {
         status,
         prioridade,
         setorAtual,
-        linhaProduto
+        linhaProduto,
+        previsaoEntrega
       ]
     );
 
@@ -4768,25 +4780,29 @@ app.get('/api/producao', async (req, res) => {
           COALESCE(
             fpd.data_entrega,
             pi_op.pits_previsao,
-            pi_pedido.pits_previsao
+            pi_pedido.pits_previsao,
+            pl.previsao_entrega
           ) AS pits_previsao,
 
           COALESCE(
             fpd.data_entrega,
             pi_op.pits_previsao,
-            pi_pedido.pits_previsao
+            pi_pedido.pits_previsao,
+            pl.previsao_entrega
           ) AS previsao_entrega,
 
           COALESCE(
             fpd.data_entrega,
             pi_op.pits_previsao,
-            pi_pedido.pits_previsao
+            pi_pedido.pits_previsao,
+            pl.previsao_entrega
           ) AS deliveryDate,
 
           COALESCE(
             fpd.data_entrega,
             pi_op.pits_previsao,
-            pi_pedido.pits_previsao
+            pi_pedido.pits_previsao,
+            pl.previsao_entrega
           ) AS data_entrega,
 
           fpd.data_entrega AS data_entrega_override,
@@ -4980,7 +4996,8 @@ app.patch('/api/producao/:id', async (req, res) => {
       'ff_expedientePausedStatus',
       'ff_history',
       'ff_sectorMetrics',
-      'ff_comments'
+      'ff_comments',
+      'previsao_entrega'
     ];
 
     const body = req.body || {};
