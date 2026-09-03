@@ -3729,6 +3729,9 @@ async function criarLoteManual(req, res) {
     const tipoLote = normalizeProductionTipo(body.tipo_lote || body.tipo || body.productType || body.product_type || body.linha_produto || body.linha, produtoNome, produtoCodigo);
     const linhaProduto = String(body.linha_produto || body.linha || body.product_type || tipoLote).trim();
     const prioridade = String(body.prioridade || body.urgencia || 'normal').trim();
+    const requesterName = String(body.requester_name || body.solicitante || '').trim() || null;
+    const requesterId   = String(body.requester_id   || '').trim() || null;
+    const application   = String(body.application    || body.aplicacao || '').trim() || null;
     const previsaoEntrega = String(body.previsao_entrega || body.deliveryDate || body.data_entrega || body.pits_previsao || '').trim() || null;
     const setorAtual = String(body.setor_atual || body.setor || 'moagem').trim();
     const status = String(body.status || 'aguardando').trim();
@@ -3812,6 +3815,20 @@ async function criarLoteManual(req, res) {
       `SELECT * FROM producao_lotes WHERE id = ? LIMIT 1`,
       [result.insertId]
     );
+
+    // Auto-create ff_samples quando tipo_lote = 'amostra'
+    if (tipoLote === 'amostra') {
+      try {
+        await ensureSamplesTables();
+        await dbPool.query(
+          `INSERT IGNORE INTO ff_samples (bridge_id, op, numero_pedido, requester_id, requester_name, application, priority)
+           VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          [result.insertId, op, numeroPedido || `MANUAL-${op}`, requesterId, requesterName, application, prioridade]
+        );
+      } catch (sErr) {
+        console.warn('[amostras] Erro ao criar ff_samples:', sErr.message);
+      }
+    }
 
     return res.json({
       ok: true,
@@ -7506,6 +7523,252 @@ app.patch('/api/tables/:table/:id', updateGenericTableRow);
 app.delete('/api/tables/:table/:id', deleteGenericTableRow);
 
 // =========================
+// AMOSTRAS
+// =========================
+
+async function ensureSamplesTables() {
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_samples (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      bridge_id INT NOT NULL,
+      op VARCHAR(50) NULL,
+      numero_pedido VARCHAR(100) NULL,
+      requester_id VARCHAR(100) NULL,
+      requester_name VARCHAR(200) NULL,
+      application TEXT NULL,
+      priority ENUM('baixa','normal','alta') DEFAULT 'normal',
+      technical_result ENUM('aprovada','reprovada','aguardando') DEFAULT 'aguardando',
+      technical_result_at DATETIME NULL,
+      technical_rejection_reason VARCHAR(100) NULL,
+      technical_feedback_notes TEXT NULL,
+      commercial_status ENUM('aguardando','aprovada_aguardando_pedido','convertida','nao_convertida') DEFAULT 'aguardando',
+      commercial_result_at DATETIME NULL,
+      commercial_failure_reason VARCHAR(100) NULL,
+      generated_order_number VARCHAR(100) NULL,
+      generated_order_value DECIMAL(12,2) NULL,
+      delivered_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      UNIQUE KEY uq_bridge_id (bridge_id),
+      INDEX idx_op (op),
+      INDEX idx_requester (requester_id)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
+  await dbPool.query(`
+    CREATE TABLE IF NOT EXISTS ff_sample_history (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      sample_id INT NOT NULL,
+      action TEXT NOT NULL,
+      user_id VARCHAR(100) NULL,
+      user_name VARCHAR(200) NULL,
+      created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_sample (sample_id)
+    ) CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci
+  `);
+}
+
+app.get('/api/amostras', async (req, res) => {
+  try {
+    await ensureSamplesTables();
+    const conditions = [`pl.tipo_lote = 'amostra'`];
+    const params = [];
+    if (req.query.requester_id) {
+      conditions.push('COALESCE(s.requester_id, \'\') = ?');
+      params.push(String(req.query.requester_id));
+    }
+    const where = `WHERE ${conditions.join(' AND ')}`;
+    const [rows] = await dbPool.query(`
+      SELECT
+        pl.id AS bridge_id,
+        pl.op,
+        pl.numero_pedido,
+        pl.produto_nome,
+        pl.produto_codigo,
+        pl.cliente_nome,
+        pl.quantidade,
+        pl.setor_atual,
+        pl.prioridade,
+        pl.criado_em,
+        pl.previsao_entrega,
+        COALESCE(s.id, NULL) AS sample_id,
+        COALESCE(s.requester_id, '') AS requester_id,
+        COALESCE(s.requester_name, '') AS requester_name,
+        COALESCE(s.application, '') AS application,
+        COALESCE(s.priority, 'normal') AS priority,
+        COALESCE(s.technical_result, 'aguardando') AS technical_result,
+        s.technical_result_at,
+        COALESCE(s.technical_rejection_reason, '') AS technical_rejection_reason,
+        COALESCE(s.technical_feedback_notes, '') AS technical_feedback_notes,
+        COALESCE(s.commercial_status, 'aguardando') AS commercial_status,
+        s.commercial_result_at,
+        COALESCE(s.commercial_failure_reason, '') AS commercial_failure_reason,
+        COALESCE(s.generated_order_number, '') AS generated_order_number,
+        s.generated_order_value,
+        s.delivered_at,
+        s.created_at AS sample_created_at
+      FROM producao_lotes pl
+      LEFT JOIN ff_samples s ON s.bridge_id = pl.id
+      ${where}
+      ORDER BY pl.criado_em DESC
+    `, params);
+    res.json({ ok: true, total: rows.length, data: rows });
+  } catch (err) {
+    console.error('GET /api/amostras erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar amostras', err.message);
+  }
+});
+
+app.get('/api/amostras/:id', async (req, res) => {
+  try {
+    await ensureSamplesTables();
+    const id = req.params.id;
+    const [rows] = await dbPool.query(`
+      SELECT
+        pl.id AS bridge_id,
+        pl.op,
+        pl.numero_pedido,
+        pl.produto_nome,
+        pl.produto_codigo,
+        pl.cliente_nome,
+        pl.quantidade,
+        pl.setor_atual,
+        pl.prioridade,
+        pl.criado_em,
+        pl.previsao_entrega,
+        s.id,
+        COALESCE(s.requester_id, '') AS requester_id,
+        COALESCE(s.requester_name, '') AS requester_name,
+        COALESCE(s.application, '') AS application,
+        COALESCE(s.priority, 'normal') AS priority,
+        COALESCE(s.technical_result, 'aguardando') AS technical_result,
+        s.technical_result_at,
+        COALESCE(s.technical_rejection_reason, '') AS technical_rejection_reason,
+        COALESCE(s.technical_feedback_notes, '') AS technical_feedback_notes,
+        COALESCE(s.commercial_status, 'aguardando') AS commercial_status,
+        s.commercial_result_at,
+        COALESCE(s.commercial_failure_reason, '') AS commercial_failure_reason,
+        COALESCE(s.generated_order_number, '') AS generated_order_number,
+        s.generated_order_value,
+        s.delivered_at
+      FROM producao_lotes pl
+      LEFT JOIN ff_samples s ON s.bridge_id = pl.id
+      WHERE pl.id = ? OR s.id = ?
+      LIMIT 1
+    `, [id, id]);
+    if (!rows.length) return sendError(res, 404, 'Amostra não encontrada');
+    const row = rows[0];
+    const sampleId = row.id;
+    let history = [];
+    if (sampleId) {
+      const [h] = await dbPool.query(
+        `SELECT * FROM ff_sample_history WHERE sample_id = ? ORDER BY created_at ASC`, [sampleId]
+      );
+      history = h;
+    }
+    res.json({ ok: true, data: { ...row, history } });
+  } catch (err) {
+    console.error('GET /api/amostras/:id erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar amostra', err.message);
+  }
+});
+
+app.post('/api/amostras/upsert', async (req, res) => {
+  try {
+    await ensureSamplesTables();
+    const body = req.body || {};
+    const bridgeId = Number(body.bridge_id);
+    if (!bridgeId) return sendError(res, 400, 'bridge_id obrigatório');
+    const [existing] = await dbPool.query(`SELECT id FROM ff_samples WHERE bridge_id = ? LIMIT 1`, [bridgeId]);
+    if (existing.length) {
+      await dbPool.query(
+        `UPDATE ff_samples SET
+          requester_id = CASE WHEN ? IS NOT NULL THEN ? ELSE requester_id END,
+          requester_name = CASE WHEN ? IS NOT NULL THEN ? ELSE requester_name END,
+          application = CASE WHEN ? IS NOT NULL THEN ? ELSE application END,
+          priority = CASE WHEN ? IS NOT NULL THEN ? ELSE priority END,
+          updated_at = NOW()
+        WHERE bridge_id = ?`,
+        [body.requester_id||null, body.requester_id||null,
+         body.requester_name||null, body.requester_name||null,
+         body.application||null, body.application||null,
+         body.priority||null, body.priority||null,
+         bridgeId]
+      );
+      const [updated] = await dbPool.query(`SELECT * FROM ff_samples WHERE bridge_id = ?`, [bridgeId]);
+      return res.json({ ok: true, data: updated[0] });
+    }
+    const [result] = await dbPool.query(
+      `INSERT INTO ff_samples (bridge_id, op, numero_pedido, requester_id, requester_name, application, priority)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      [bridgeId, body.op||null, body.numero_pedido||null,
+       body.requester_id||null, body.requester_name||null,
+       body.application||null, body.priority||'normal']
+    );
+    const [created] = await dbPool.query(`SELECT * FROM ff_samples WHERE id = ?`, [result.insertId]);
+    res.json({ ok: true, data: created[0] });
+  } catch (err) {
+    console.error('POST /api/amostras/upsert erro:', err.message);
+    sendError(res, 500, 'Erro ao salvar amostra', err.message);
+  }
+});
+
+app.patch('/api/amostras/:id', async (req, res) => {
+  try {
+    await ensureSamplesTables();
+    const id = req.params.id;
+    const body = req.body || {};
+    const allowed = [
+      'requester_id','requester_name','application','priority',
+      'technical_result','technical_rejection_reason','technical_feedback_notes',
+      'commercial_status','commercial_failure_reason',
+      'generated_order_number','generated_order_value','delivered_at'
+    ];
+    const updates = [];
+    const values = [];
+    for (const field of allowed) {
+      if (body[field] !== undefined) {
+        updates.push(`${field} = ?`);
+        values.push(body[field] === '' ? null : body[field]);
+      }
+    }
+    if (body.technical_result && body.technical_result !== 'aguardando' && body.technical_result_at === undefined) {
+      updates.push('technical_result_at = NOW()');
+    }
+    if (body.commercial_status && body.commercial_status !== 'aguardando' && body.commercial_result_at === undefined) {
+      updates.push('commercial_result_at = NOW()');
+    }
+    if (body.delivered_at === 'NOW()') {
+      updates.push('delivered_at = NOW()');
+    }
+    if (!updates.length) return sendError(res, 400, 'Nenhum campo para atualizar');
+    updates.push('updated_at = NOW()');
+    values.push(id);
+    await dbPool.query(`UPDATE ff_samples SET ${updates.join(', ')} WHERE id = ?`, values);
+    const [rows] = await dbPool.query(`SELECT * FROM ff_samples WHERE id = ?`, [id]);
+    if (!rows.length) return sendError(res, 404, 'Amostra não encontrada');
+    res.json({ ok: true, data: rows[0] });
+  } catch (err) {
+    console.error('PATCH /api/amostras/:id erro:', err.message);
+    sendError(res, 500, 'Erro ao atualizar amostra', err.message);
+  }
+});
+
+app.post('/api/amostras/:id/history', async (req, res) => {
+  try {
+    await ensureSamplesTables();
+    const { action, user_id, user_name } = req.body || {};
+    if (!action) return sendError(res, 400, 'action obrigatório');
+    await dbPool.query(
+      `INSERT INTO ff_sample_history (sample_id, action, user_id, user_name) VALUES (?, ?, ?, ?)`,
+      [req.params.id, String(action), user_id||null, user_name||null]
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    sendError(res, 500, 'Erro ao salvar histórico', err.message);
+  }
+});
+
+// =========================
 // 404
 // =========================
 
@@ -7529,6 +7792,7 @@ app.use((req, res) => {
     await ensureSectorShiftEventsTable();
     await ensurePedidoDatasTable();
     await ensureProductionLotesTimeColumns();
+    await ensureSamplesTables().catch(e => console.warn('[amostras] ensureSamplesTables:', e.message));
     await initVapidKeys().catch(e => console.warn('[push] initVapidKeys:', e.message));
 
     app.listen(PORT, () => {
