@@ -7588,9 +7588,9 @@ app.get('/api/amostras', async (req, res) => {
         pl.quantidade,
         pl.setor_atual,
         pl.prioridade,
-        pl.data_criacao AS criado_em,
-        pl.previsao_entrega,
-        COALESCE(s.id, NULL) AS sample_id,
+        COALESCE(pl.data_criacao, pl.updated_at) AS criado_em,
+        COALESCE(pl.previsao_entrega, NULL) AS previsao_entrega,
+        s.id AS sample_id,
         COALESCE(s.requester_id, '') AS requester_id,
         COALESCE(s.requester_name, '') AS requester_name,
         COALESCE(s.application, '') AS application,
@@ -7609,7 +7609,7 @@ app.get('/api/amostras', async (req, res) => {
       FROM producao_lotes pl
       LEFT JOIN ff_samples s ON s.bridge_id = pl.id
       ${where}
-      ORDER BY pl.criado_em DESC
+      ORDER BY COALESCE(pl.data_criacao, pl.updated_at) DESC
     `, params);
     res.json({ ok: true, total: rows.length, data: rows });
   } catch (err) {
@@ -7633,8 +7633,8 @@ app.get('/api/amostras/:id', async (req, res) => {
         pl.quantidade,
         pl.setor_atual,
         pl.prioridade,
-        pl.data_criacao AS criado_em,
-        pl.previsao_entrega,
+        COALESCE(pl.data_criacao, pl.updated_at) AS criado_em,
+        COALESCE(pl.previsao_entrega, NULL) AS previsao_entrega,
         s.id,
         COALESCE(s.requester_id, '') AS requester_id,
         COALESCE(s.requester_name, '') AS requester_name,
