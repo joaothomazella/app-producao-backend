@@ -2875,6 +2875,13 @@ app.post('/api/login', async (req, res) => {
 // A partir daqui, toda rota /api exige token.
 app.use('/api', requireApiToken);
 
+// Otimizador: utiliza a autenticação e a medição de tempos já existentes.
+require('./optimizer').registerOptimizer({
+  app, dbPool,
+  metrics: (row, closed) => rtBuildTempoRowsFromLot(row, '', closed).map(m => ({ ...m, sector: m.setor })),
+  shifts: rtLoadShiftClosedIntervals
+});
+
 // =========================
 // STATS GERAIS
 // =========================
@@ -3919,80 +3926,98 @@ app.get('/api/lote/:op', async (req, res) => {
 // Usada pelo Kanban no carregamento inicial.
 // Não faz COUNT, JOIN, SELECT *, histórico, rotas ou processamento pesado em JS.
 // IMPORTANTE: manter esta rota ANTES de /api/producao/:id.
+// Mutex + cache para /api/producao/ativos — evita queries paralelas que travam o banco.
+let _ativosCache = null;
+let _ativosCacheAt = 0;
+let _ativosPromise = null;
+const _ATIVOS_TTL = 8000;
+
 app.get('/api/producao/ativos', async (req, res) => {
-  try {
+  // Cache de 8s — todas as requisições paralelas recebem o mesmo resultado sem bater no banco.
+  if (_ativosCache && (Date.now() - _ativosCacheAt) < _ATIVOS_TTL) {
+    return res.json(_ativosCache);
+  }
+
+  // Deduplicação: se a query já está rodando, aguarda o mesmo resultado em vez de disparar outra.
+  if (!_ativosPromise) {
     const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 300), 1), 500);
+    _ativosPromise = (async () => {
+      try {
+        const [rows] = await dbPool.query(
+          `
+            SELECT
+              pl.id,
+              pl.op,
+              pl.numero_pedido,
+              pl.cliente_codigo,
+              pl.cliente_nome,
+              pl.produto_codigo,
+              pl.produto_nome,
+              COALESCE(NULLIF(pl.quantidade, 0), erp.pits_peso, erp.pits_qtde, 0) AS quantidade,
+              erp.pits_qtde,
+              erp.pits_peso,
+              COALESCE(fpd.data_entrega, erp.pits_previsao) AS pits_previsao,
+              COALESCE(fpd.data_entrega, erp.pits_previsao) AS deliveryDate,
+              COALESCE(fpd.data_entrega, erp.pits_previsao) AS previsao_entrega,
+              COALESCE(fpd.data_entrega, erp.pits_previsao) AS data_entrega,
+              fpd.data_entrega AS data_entrega_override,
+              COALESCE(NULLIF(TRIM(pl.cliente_endereco), ''), c.cli_endereco, '') AS cliente_endereco,
+              COALESCE(NULLIF(TRIM(pl.cliente_bairro), ''), c.cli_bairro, '') AS cliente_bairro,
+              COALESCE(NULLIF(TRIM(pl.cliente_cidade), ''), c.cli_cidade, '') AS cliente_cidade,
+              COALESCE(NULLIF(TRIM(pl.cliente_cep), ''), c.cli_cep, '') AS cliente_cep,
+              COALESCE(NULLIF(TRIM(pl.cliente_estado), ''), c.cli_estado, '') AS cliente_estado,
+              pl.tipo_lote,
+              pl.prioridade,
+              pl.setor_atual,
+              pl.status,
+              pl.linha_produto,
+              pl.ff_lotStatus,
+              pl.ff_sectorEnteredAt,
+              pl.ff_workSessions,
+              pl.ff_expedientePausedStatus,
+              pl.ff_history,
+              pl.ff_sectorMetrics,
+              pl.data_criacao,
+              pl.updated_at
+            FROM producao_lotes pl
+            LEFT JOIN (
+              SELECT
+                TRIM(pits_op) AS pits_op,
+                MAX(pits_previsao) AS pits_previsao,
+                MAX(COALESCE(pits_peso, 0)) AS pits_peso,
+                MAX(COALESCE(pits_qtde, 0)) AS pits_qtde
+              FROM cli_pedidos_itens
+              WHERE pits_op IS NOT NULL AND TRIM(pits_op) <> ''
+              GROUP BY TRIM(pits_op)
+            ) erp
+              ON TRIM(erp.pits_op) = TRIM(pl.op)
+            LEFT JOIN ff_pedidos_datas fpd
+              ON TRIM(fpd.pedido) = TRIM(pl.numero_pedido)
+            LEFT JOIN cli_clientes c
+              ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(pl.cliente_codigo) AS UNSIGNED)
+            WHERE
+              LOWER(COALESCE(pl.status, '')) NOT IN ('entregue', 'finalizado', 'cancelado')
+              AND LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado')
+            ORDER BY
+              (LOWER(COALESCE(pl.status,'')) = 'rejeitado' OR LOWER(COALESCE(pl.ff_lotStatus,'')) = 'rejected') ASC,
+              pl.id DESC
+            LIMIT ?
+          `,
+          [limit]
+        );
+        const result = { ok: true, total: rows.length, limit, mode: 'fast', data: rows };
+        _ativosCache = result;
+        _ativosCacheAt = Date.now();
+        return result;
+      } finally {
+        _ativosPromise = null;
+      }
+    })();
+  }
 
-    const [rows] = await dbPool.query(
-      `
-        SELECT
-          pl.id,
-          pl.op,
-          pl.numero_pedido,
-          pl.cliente_codigo,
-          pl.cliente_nome,
-          pl.produto_codigo,
-          pl.produto_nome,
-          COALESCE(NULLIF(pl.quantidade, 0), erp.pits_peso, erp.pits_qtde, 0) AS quantidade,
-          erp.pits_qtde,
-          erp.pits_peso,
-          COALESCE(fpd.data_entrega, erp.pits_previsao) AS pits_previsao,
-          COALESCE(fpd.data_entrega, erp.pits_previsao) AS deliveryDate,
-          COALESCE(fpd.data_entrega, erp.pits_previsao) AS previsao_entrega,
-          COALESCE(fpd.data_entrega, erp.pits_previsao) AS data_entrega,
-          fpd.data_entrega AS data_entrega_override,
-          COALESCE(NULLIF(TRIM(pl.cliente_endereco), ''), c.cli_endereco, '') AS cliente_endereco,
-          COALESCE(NULLIF(TRIM(pl.cliente_bairro), ''), c.cli_bairro, '') AS cliente_bairro,
-          COALESCE(NULLIF(TRIM(pl.cliente_cidade), ''), c.cli_cidade, '') AS cliente_cidade,
-          COALESCE(NULLIF(TRIM(pl.cliente_cep), ''), c.cli_cep, '') AS cliente_cep,
-          COALESCE(NULLIF(TRIM(pl.cliente_estado), ''), c.cli_estado, '') AS cliente_estado,
-          pl.tipo_lote,
-          pl.prioridade,
-          pl.setor_atual,
-          pl.status,
-          pl.linha_produto,
-          pl.ff_lotStatus,
-          pl.ff_sectorEnteredAt,
-          pl.ff_workSessions,
-          pl.ff_expedientePausedStatus,
-          pl.ff_history,
-          pl.ff_sectorMetrics,
-          pl.data_criacao,
-          pl.updated_at
-        FROM producao_lotes pl
-        LEFT JOIN (
-          SELECT
-            TRIM(pits_op) AS pits_op,
-            MAX(pits_previsao) AS pits_previsao,
-            MAX(COALESCE(pits_peso, 0)) AS pits_peso,
-            MAX(COALESCE(pits_qtde, 0)) AS pits_qtde
-          FROM cli_pedidos_itens
-          WHERE pits_op IS NOT NULL AND TRIM(pits_op) <> ''
-          GROUP BY TRIM(pits_op)
-        ) erp
-          ON TRIM(erp.pits_op) = TRIM(pl.op)
-        LEFT JOIN ff_pedidos_datas fpd
-          ON TRIM(fpd.pedido) = TRIM(pl.numero_pedido)
-        LEFT JOIN cli_clientes c
-          ON CAST(TRIM(c.cli_codigo) AS UNSIGNED) = CAST(TRIM(pl.cliente_codigo) AS UNSIGNED)
-        WHERE
-          LOWER(COALESCE(pl.status, '')) NOT IN ('entregue', 'finalizado', 'cancelado')
-          AND LOWER(COALESCE(pl.setor_atual, '')) NOT IN ('entregue', 'finalizado', 'cancelado')
-        ORDER BY
-          (LOWER(COALESCE(pl.status,'')) = 'rejeitado' OR LOWER(COALESCE(pl.ff_lotStatus,'')) = 'rejected') ASC,
-          pl.id DESC
-        LIMIT ?
-      `,
-      [limit]
-    );
-
-    return res.json({
-      ok: true,
-      total: rows.length,
-      limit,
-      mode: 'fast',
-      data: rows,
-    });
+  try {
+    const result = await _ativosPromise;
+    return res.json(result);
   } catch (err) {
     console.error('GET /api/producao/ativos erro:', err.message);
     return sendError(res, 500, 'Erro ao buscar lotes ativos de produção', err.message);
@@ -4732,7 +4757,17 @@ app.post('/api/admin/reprocessar-tempos', async (req, res) => {
 
 
 
+// Cache simples para /api/producao — evita múltiplas queries pesadas simultâneas.
+let _producaoCache = null;
+let _producaoCacheAt = 0;
+const _PRODUCAO_TTL = 12000;
+
 app.get('/api/producao', async (req, res) => {
+  const hasFilters = req.query.status || req.query.setor || req.query.search;
+  if (!hasFilters && _producaoCache && (Date.now() - _producaoCacheAt) < _PRODUCAO_TTL) {
+    return res.json(_producaoCache);
+  }
+
   try {
     const hasProducaoLotes = await tableExists('producao_lotes');
     if (!hasProducaoLotes) {
@@ -4955,13 +4990,14 @@ app.get('/api/producao', async (req, res) => {
       quantidade: row.pits_qtde || row.quantidade,
     }));
 
-    res.json({
-      ok: true,
-      total: Number(total),
-      limit,
-      offset,
-      data,
-    });
+    const result = { ok: true, total: Number(total), limit, offset, data };
+
+    if (!hasFilters) {
+      _producaoCache = result;
+      _producaoCacheAt = Date.now();
+    }
+
+    res.json(result);
   } catch (err) {
     console.error('GET /api/producao erro:', err.message);
     sendError(res, 500, 'Erro ao buscar lotes de produção', err.message);
