@@ -1,6 +1,7 @@
 'use strict';
 
 require('dotenv').config();
+const crypto = require('crypto');
 const { dbPool } = require('./db');
 
 const syncStats = {
@@ -116,11 +117,33 @@ async function ensureOrigemItemIdUniqueIndex() {
   }
 }
 
+async function ensureRastreioTokenColumn() {
+  const exists = await columnExists('producao_lotes', 'rastreio_token');
+
+  if (!exists) {
+    await dbPool.query(`
+      ALTER TABLE producao_lotes
+      ADD COLUMN rastreio_token VARCHAR(32) NULL
+    `);
+
+    const hasIndex = await indexExists('producao_lotes', 'ux_producao_lotes_rastreio_token');
+    if (!hasIndex) {
+      await dbPool.query(`
+        ALTER TABLE producao_lotes
+        ADD UNIQUE KEY ux_producao_lotes_rastreio_token (rastreio_token)
+      `);
+    }
+
+    console.log('🔗 Coluna rastreio_token adicionada em producao_lotes');
+  }
+}
+
 async function ensureSyncStructure() {
   await ensureSyncStateTable();
   await ensureProducaoLotesTable();
   await ensureOrigemItemIdColumn();
   await ensureOrigemItemIdUniqueIndex();
+  await ensureRastreioTokenColumn();
 }
 
 // =========================
@@ -222,8 +245,9 @@ async function runSync() {
           cliente_cep,
           cliente_estado,
           status,
-          setor_atual
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aguardando', 'moagem')
+          setor_atual,
+          rastreio_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'aguardando', 'moagem', ?)
         ON DUPLICATE KEY UPDATE
           numero_pedido = VALUES(numero_pedido),
           op = VALUES(op),
@@ -252,6 +276,7 @@ async function runSync() {
         row.cliente_cidade || '',
         row.cliente_cep || '',
         row.cliente_estado || '',
+        crypto.randomBytes(16).toString('hex'),
       ]
     );
 

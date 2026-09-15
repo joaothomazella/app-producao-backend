@@ -184,6 +184,39 @@ async function ensureProductionLotesManualColumns() {
     `);
     console.log('✅ Coluna producao_lotes.previsao_entrega criada.');
   }
+
+  const hasRastreioToken = await columnExists('producao_lotes', 'rastreio_token');
+  if (!hasRastreioToken) {
+    await dbPool.query(`
+      ALTER TABLE producao_lotes
+      ADD COLUMN rastreio_token VARCHAR(32) NULL
+    `);
+    await dbPool.query(`
+      ALTER TABLE producao_lotes
+      ADD UNIQUE KEY ux_producao_lotes_rastreio_token (rastreio_token)
+    `);
+    console.log('✅ Coluna producao_lotes.rastreio_token criada.');
+  }
+}
+
+function gerarRastreioToken() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+async function ensureLoteRastreioToken(loteId) {
+  const [rows] = await dbPool.query(
+    `SELECT rastreio_token FROM producao_lotes WHERE id = ? LIMIT 1`,
+    [loteId]
+  );
+  if (!rows.length) return null;
+  if (rows[0].rastreio_token) return rows[0].rastreio_token;
+
+  const token = gerarRastreioToken();
+  await dbPool.query(
+    `UPDATE producao_lotes SET rastreio_token = ? WHERE id = ?`,
+    [token, loteId]
+  );
+  return token;
 }
 
 
@@ -2872,6 +2905,56 @@ app.post('/api/login', async (req, res) => {
   }
 });
 
+// =========================
+// RASTREIO PÚBLICO (QR Code) - precisa ficar ANTES do requireApiToken
+// =========================
+// Motivo: o cliente final não tem login nem token; acessa só pelo link/QR do pedido.
+// Expõe o mínimo possível: se está pronto ou não, sem setor/detalhes internos.
+
+const RASTREIO_SETORES_PRONTO = ['pronto', 'entregue', 'finalizado'];
+
+app.get('/api/rastreio/:token', async (req, res) => {
+  try {
+    const token = String(req.params.token || '').trim();
+    if (!token || token.length < 8) {
+      return sendError(res, 400, 'Link de rastreio inválido');
+    }
+
+    const hasRastreioToken = await columnExists('producao_lotes', 'rastreio_token');
+    if (!hasRastreioToken) {
+      return sendError(res, 404, 'Pedido não encontrado');
+    }
+
+    const [rows] = await dbPool.query(
+      `SELECT numero_pedido, setor_atual, status, previsao_entrega, data_criacao
+       FROM producao_lotes
+       WHERE rastreio_token = ?
+       LIMIT 1`,
+      [token]
+    );
+
+    if (!rows.length) {
+      return sendError(res, 404, 'Pedido não encontrado');
+    }
+
+    const lote = rows[0];
+    const setor = String(lote.setor_atual || '').toLowerCase().trim();
+    const status = String(lote.status || '').toLowerCase().trim();
+    const pronto = RASTREIO_SETORES_PRONTO.includes(setor) || RASTREIO_SETORES_PRONTO.includes(status);
+
+    return res.json({
+      ok: true,
+      pronto,
+      numero_pedido: lote.numero_pedido,
+      previsao_entrega: lote.previsao_entrega,
+      data_criacao: lote.data_criacao
+    });
+  } catch (err) {
+    console.error('❌ Erro em GET /api/rastreio/:token:', err.message);
+    return sendError(res, 500, 'Erro ao consultar rastreio', err.message);
+  }
+});
+
 // A partir daqui, toda rota /api exige token.
 app.use('/api', requireApiToken);
 
@@ -3793,8 +3876,9 @@ async function criarLoteManual(req, res) {
           setor_atual,
           origem,
           linha_produto,
-          previsao_entrega
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?, ?)
+          previsao_entrega,
+          rastreio_token
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, 'MANUAL', ?, ?, ?)
       `,
       [
         numeroPedido || `MANUAL-${op}`,
@@ -3814,7 +3898,8 @@ async function criarLoteManual(req, res) {
         prioridade,
         setorAtual,
         linhaProduto,
-        previsaoEntrega
+        previsaoEntrega,
+        gerarRastreioToken()
       ]
     );
 
@@ -3847,6 +3932,25 @@ async function criarLoteManual(req, res) {
     return sendError(res, 500, 'Erro ao criar lote manual', err.message);
   }
 }
+
+// Retorna (gerando se necessário) o token de rastreio público de um lote,
+// para o admin montar o link/QR Code e enviar ao cliente.
+app.get('/api/producao/:id/rastreio', async (req, res) => {
+  try {
+    const loteId = toPositiveInt(req.params.id, 0);
+    if (!loteId) return sendError(res, 400, 'ID de lote inválido');
+
+    await ensureProductionLotesManualColumns();
+
+    const token = await ensureLoteRastreioToken(loteId);
+    if (!token) return sendError(res, 404, 'Lote não encontrado');
+
+    return res.json({ ok: true, token });
+  } catch (err) {
+    console.error('GET /api/producao/:id/rastreio erro:', err.message);
+    return sendError(res, 500, 'Erro ao gerar link de rastreio', err.message);
+  }
+});
 
 app.post('/api/producao/manual', criarLoteManual);
 app.post('/api/lotes', criarLoteManual);
