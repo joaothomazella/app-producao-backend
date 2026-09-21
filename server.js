@@ -4560,6 +4560,225 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
 });
 
 
+// =========================
+// PRODUÇÃO - RELATÓRIO DE LITRAGEM
+// =========================
+// Estima a litragem produzida (dia/semana/mês) por OP, para calcular capacidade
+// de produção. Densidade: prioriza a medida no CQ Vision (cq_analises.densidade_encontrada),
+// cai para o padrão declarado na análise (densidade_padrao) e, por fim, para a densidade
+// esperada cadastrada na própria ordem de produção (cli_pedidos_itens.pits_densidade).
+// IMPORTANTE: cli_pedidos_itens tem linhas duplicadas por OP (artefato de sincronização) com
+// peso/densidade idênticos — nunca usar SUM() direto, sempre agregar por OP com MAX() antes.
+const RL_FINAL_SECTORS = new Set(['pronto', 'entrega', 'entregue', 'finalizado', 'concluido', 'concluído']);
+
+function rlNum(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? n : null;
+}
+
+function rlToDate(v) {
+  if (!v) return null;
+  const d = v instanceof Date ? v : new Date(v);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
+function rlPad(n) { return String(n).padStart(2, '0'); }
+
+function rlDayKey(d) { return `${d.getFullYear()}-${rlPad(d.getMonth() + 1)}-${rlPad(d.getDate())}`; }
+function rlMonthKey(d) { return `${d.getFullYear()}-${rlPad(d.getMonth() + 1)}`; }
+function rlWeekKey(d) {
+  const t = new Date(Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()));
+  const dayNum = (t.getUTCDay() + 6) % 7;
+  t.setUTCDate(t.getUTCDate() - dayNum + 3);
+  const firstThursday = new Date(Date.UTC(t.getUTCFullYear(), 0, 4));
+  const week = 1 + Math.round(((t - firstThursday) / 86400000 - 3 + ((firstThursday.getUTCDay() + 6) % 7)) / 7);
+  return `${t.getUTCFullYear()}-W${rlPad(week)}`;
+}
+
+app.get('/api/producao/relatorio-litragem', async (req, res) => {
+  try {
+    const inicio = (req.query.inicio || '').trim();
+    const fim = (req.query.fim || '').trim();
+    const hasRange = !!(inicio || fim);
+    const inicioMs = inicio ? rlToDate(`${inicio}T00:00:00-03:00`) : null;
+    const fimMs = fim ? rlToDate(`${fim}T23:59:59-03:00`) : null;
+
+    const [pedidoRows] = await dbPool.query(`
+      SELECT
+        TRIM(pits_op) AS op,
+        MAX(pits_peso) AS peso_kg,
+        MAX(pits_densidade) AS densidade_pedido,
+        MAX(pits_numero) AS pedido,
+        MAX(pits_cliente) AS cliente_codigo,
+        MAX(pits_produto) AS produto_codigo,
+        MAX(pits_nome_produto) AS produto_nome,
+        MAX(pits_previsao) AS previsao
+      FROM cli_pedidos_itens
+      WHERE pits_op IS NOT NULL AND TRIM(pits_op) <> ''
+      GROUP BY TRIM(pits_op)
+    `);
+
+    const [analiseRows] = await dbPool.query(`
+      SELECT a.id, TRIM(a.op) AS op, a.pedido, a.produto_nome, a.densidade_encontrada, a.densidade_padrao,
+             a.data_analise, a.criado_em
+      FROM cq_analises a
+      INNER JOIN (
+        SELECT TRIM(op) AS op_trim, MAX(id) AS max_id
+        FROM cq_analises
+        WHERE op IS NOT NULL AND TRIM(op) <> ''
+        GROUP BY TRIM(op)
+      ) latest ON latest.op_trim = TRIM(a.op) AND latest.max_id = a.id
+    `);
+
+    const [loteRows] = await dbPool.query(`
+      SELECT l.op, l.numero_pedido, l.status, l.ff_lotStatus, l.setor_atual, l.data_criacao, l.updated_at
+      FROM producao_lotes l
+      INNER JOIN (
+        SELECT TRIM(op) AS op_trim, MAX(id) AS max_id
+        FROM producao_lotes
+        WHERE op IS NOT NULL AND TRIM(op) <> ''
+        GROUP BY TRIM(op)
+      ) latest ON latest.op_trim = TRIM(l.op) AND latest.max_id = l.id
+    `);
+
+    const analiseMap = new Map();
+    for (const a of analiseRows) analiseMap.set(a.op, a);
+    const loteMap = new Map();
+    for (const l of loteRows) loteMap.set(String(l.op || '').trim(), l);
+
+    const detalhe = [];
+    for (const p of pedidoRows) {
+      const op = p.op;
+      const analise = analiseMap.get(op) || null;
+      const lote = loteMap.get(op) || null;
+
+      const statusLower = String(lote?.status || '').trim().toLowerCase();
+      const ffStatusLower = String(lote?.ff_lotStatus || '').trim().toLowerCase();
+      const setorLower = String(lote?.setor_atual || '').trim().toLowerCase();
+      const rejeitado = statusLower === 'rejeitado' || ffStatusLower === 'rejeitado';
+      const loteFinalizado = RL_FINAL_SECTORS.has(ffStatusLower) || RL_FINAL_SECTORS.has(setorLower);
+
+      const temAnalise = !!analise;
+      const elegivel = !rejeitado && (temAnalise || loteFinalizado);
+
+      let densidade = null;
+      let densidade_fonte = null;
+      if (analise && rlNum(analise.densidade_encontrada)) {
+        densidade = rlNum(analise.densidade_encontrada);
+        densidade_fonte = 'cq_vision_medida';
+      } else if (analise && rlNum(analise.densidade_padrao)) {
+        densidade = rlNum(analise.densidade_padrao);
+        densidade_fonte = 'cq_vision_padrao_analise';
+      } else if (rlNum(p.densidade_pedido)) {
+        densidade = rlNum(p.densidade_pedido);
+        densidade_fonte = 'ordem_producao_esperada';
+      }
+
+      const peso_kg = rlNum(p.peso_kg);
+
+      let dataProducao = null;
+      let data_fonte = null;
+      if (analise && rlToDate(analise.data_analise)) {
+        dataProducao = rlToDate(analise.data_analise); data_fonte = 'cq_analise_data_analise';
+      } else if (analise && rlToDate(analise.criado_em)) {
+        dataProducao = rlToDate(analise.criado_em); data_fonte = 'cq_analise_criado_em';
+      } else if (lote && rlToDate(lote.data_criacao)) {
+        dataProducao = rlToDate(lote.data_criacao); data_fonte = 'lote_data_criacao';
+      }
+
+      let motivo_exclusao = null;
+      if (rejeitado) motivo_exclusao = 'lote_rejeitado';
+      else if (!elegivel) motivo_exclusao = 'sem_analise_cq_e_sem_lote_finalizado';
+      else if (!peso_kg) motivo_exclusao = 'sem_peso';
+      else if (!densidade) motivo_exclusao = 'sem_densidade';
+      else if (!dataProducao) motivo_exclusao = 'sem_data_producao';
+      else if (hasRange) {
+        const ms = dataProducao.getTime();
+        if (inicioMs && ms < inicioMs.getTime()) motivo_exclusao = 'fora_do_periodo';
+        if (fimMs && ms > fimMs.getTime()) motivo_exclusao = 'fora_do_periodo';
+      }
+
+      const litros = (!motivo_exclusao && peso_kg && densidade) ? peso_kg / densidade : null;
+      const incluido = !motivo_exclusao && litros != null;
+
+      detalhe.push({
+        op,
+        pedido: p.pedido || lote?.numero_pedido || null,
+        produto_codigo: p.produto_codigo || null,
+        produto_nome: p.produto_nome || analise?.produto_nome || null,
+        peso_kg,
+        densidade_usada: densidade,
+        densidade_fonte,
+        litros,
+        data_producao: dataProducao ? dataProducao.toISOString() : null,
+        data_fonte,
+        status_lote: lote?.status || null,
+        setor_atual: lote?.setor_atual || null,
+        tem_analise_cq: temAnalise,
+        incluido,
+        motivo_exclusao
+      });
+    }
+
+    const incluidos = detalhe.filter(r => r.incluido);
+    const excluidos = detalhe.filter(r => !r.incluido);
+
+    const porDia = new Map();
+    const porSemana = new Map();
+    const porMes = new Map();
+    const bump = (map, key, litros) => {
+      const cur = map.get(key) || { chave: key, litros: 0, ops: 0 };
+      cur.litros += litros;
+      cur.ops += 1;
+      map.set(key, cur);
+    };
+    for (const r of incluidos) {
+      const d = new Date(r.data_producao);
+      bump(porDia, rlDayKey(d), r.litros);
+      bump(porSemana, rlWeekKey(d), r.litros);
+      bump(porMes, rlMonthKey(d), r.litros);
+    }
+
+    const toSortedArr = (map) => Array.from(map.values()).sort((a, b) => a.chave.localeCompare(b.chave))
+      .map(x => ({ ...x, litros: Math.round(x.litros * 100) / 100 }));
+
+    const diario = toSortedArr(porDia);
+    const semanal = toSortedArr(porSemana);
+    const mensal = toSortedArr(porMes);
+
+    const totalLitros = incluidos.reduce((s, r) => s + r.litros, 0);
+    const capacidade = {
+      diaria_media: diario.length ? Math.round((totalLitros / diario.length) * 100) / 100 : 0,
+      semanal_media: semanal.length ? Math.round((totalLitros / semanal.length) * 100) / 100 : 0,
+      mensal_media: mensal.length ? Math.round((totalLitros / mensal.length) * 100) / 100 : 0
+    };
+
+    return res.json({
+      ok: true,
+      filtros: { inicio: inicio || null, fim: fim || null },
+      resumo: {
+        total_ops_encontradas: detalhe.length,
+        total_ops_incluidas: incluidos.length,
+        total_ops_excluidas: excluidos.length,
+        total_litros: Math.round(totalLitros * 100) / 100,
+        dias_com_producao: diario.length,
+        semanas_com_producao: semanal.length,
+        meses_com_producao: mensal.length,
+        capacidade_estimada: capacidade
+      },
+      diario,
+      semanal,
+      mensal,
+      excluidos: excluidos.map(r => ({ op: r.op, pedido: r.pedido, motivo_exclusao: r.motivo_exclusao })),
+      detalhe
+    });
+  } catch (err) {
+    console.error('GET /api/producao/relatorio-litragem erro:', err.message);
+    return sendError(res, 500, 'Erro ao gerar relatório de litragem', err.message);
+  }
+});
+
+
 // ===================================================
 // PATCH INDUSCOLOR – REPROCESSAMENTO SEGURO DOS TEMPOS ANTIGOS
 // Cole este bloco no server.js, de preferência logo depois da rota:
