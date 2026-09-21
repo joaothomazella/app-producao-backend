@@ -4576,6 +4576,15 @@ function rlNum(v) {
   return Number.isFinite(n) && n > 0 ? n : null;
 }
 
+// Densidade de tintas/vernizes na prática fica entre ~0.3 e ~3.5 g/cm³. Valores fora
+// disso são erro de digitação (ex.: OP 087813 tem densidade_encontrada = "087813",
+// claramente o número da OP colado no campo errado) — trata como ausente e cai
+// para a próxima fonte da cadeia de fallback.
+function rlValidDensity(v) {
+  const n = rlNum(v);
+  return (n != null && n >= 0.3 && n <= 3.5) ? n : null;
+}
+
 function rlToDate(v) {
   if (!v) return null;
   const d = v instanceof Date ? v : new Date(v);
@@ -4663,14 +4672,14 @@ app.get('/api/producao/relatorio-litragem', async (req, res) => {
 
       let densidade = null;
       let densidade_fonte = null;
-      if (analise && rlNum(analise.densidade_encontrada)) {
-        densidade = rlNum(analise.densidade_encontrada);
+      if (analise && rlValidDensity(analise.densidade_encontrada)) {
+        densidade = rlValidDensity(analise.densidade_encontrada);
         densidade_fonte = 'cq_vision_medida';
-      } else if (analise && rlNum(analise.densidade_padrao)) {
-        densidade = rlNum(analise.densidade_padrao);
+      } else if (analise && rlValidDensity(analise.densidade_padrao)) {
+        densidade = rlValidDensity(analise.densidade_padrao);
         densidade_fonte = 'cq_vision_padrao_analise';
-      } else if (rlNum(p.densidade_pedido)) {
-        densidade = rlNum(p.densidade_pedido);
+      } else if (rlValidDensity(p.densidade_pedido)) {
+        densidade = rlValidDensity(p.densidade_pedido);
         densidade_fonte = 'ordem_producao_esperada';
       }
 
