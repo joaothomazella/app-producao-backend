@@ -4940,7 +4940,11 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
       sem_peso: 0,
       sem_densidade: 0,
       sem_passagem_concluida: 0,
+      // lote passou por setores (conta como OP) mas não tem peso e/ou densidade,
+      // então fica de fora apenas das somas de litragem
+      lotes_sem_litragem: 0,
       lotes_computados: 0,
+      lotes_computados_com_litragem: 0,
       passagens_concluidas: 0,
       passagens_em_aberto: 0,
       passagens_setor_final: 0,
@@ -4988,7 +4992,7 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         peso = rlNum(pedido.peso_kg);
         if (peso) peso_fonte = 'pedido_pits_peso';
       }
-      if (!peso) { diag.sem_peso++; continue; }
+      if (!peso) diag.sem_peso++;
 
       let densidade = null;
       let densidade_fonte = null;
@@ -5002,9 +5006,13 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         const mediaProduto = densProdutoMap.get(String(l.produto_codigo || '').trim());
         if (mediaProduto) { densidade = mediaProduto.d; densidade_fonte = mediaProduto.fonte; }
       }
-      if (!densidade) { diag.sem_densidade++; continue; }
+      if (!densidade) diag.sem_densidade++;
 
-      const litros = peso / densidade;
+      // Sem peso ou sem densidade não dá para calcular litros, mas a OP passou pelo setor
+      // do mesmo jeito. O lote continua contando na contagem de ordens de produção e fica
+      // de fora apenas das somas de litragem.
+      const litros = (peso && densidade) ? (peso / densidade) : null;
+      if (litros == null) diag.lotes_sem_litragem++;
       const produtoNome = l.produto_nome || pedido?.produto_nome || null;
       const ehBase = lsIsBase(l.tipo_lote, l.linha_produto, produtoNome);
 
@@ -5054,16 +5062,21 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
             setor: atual.setor,
             label: LS_SETOR_LABELS[atual.setor] || atual.setor,
             produtivo: LS_SETORES_PRODUTIVOS.has(atual.setor),
-            litros: 0, litros_base: 0, passagens: 0, passagens_mesmo_dia: 0,
-            lotes: new Set(), dias: new Set()
+            litros: 0, litros_base: 0, passagens: 0, passagens_base: 0, passagens_mesmo_dia: 0,
+            lotes: new Set(), lotesBase: new Set(), dias: new Set(), diasLitros: new Set()
           };
           setorAgg.set(atual.setor, sa);
         }
-        sa.litros += litros;
-        if (ehBase) sa.litros_base += litros;
+        if (litros != null) {
+          sa.litros += litros;
+          if (ehBase) sa.litros_base += litros;
+          sa.diasLitros.add(dia);
+        }
         sa.passagens++;
+        if (ehBase) sa.passagens_base++;
         if (mesmoDia) sa.passagens_mesmo_dia++;
         sa.lotes.add(chaveLote);
+        if (ehBase) sa.lotesBase.add(chaveLote);
         sa.dias.add(dia);
 
         // --- agregado por dia ---
@@ -5073,10 +5086,13 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
           diaAgg.set(dia, da);
         }
         let ds = da.setores.get(atual.setor);
-        if (!ds) { ds = { litros: 0, litros_base: 0, passagens: 0 }; da.setores.set(atual.setor, ds); }
-        ds.litros += litros;
-        if (ehBase) ds.litros_base += litros;
+        if (!ds) { ds = { litros: 0, litros_base: 0, passagens: 0, ops: 0, ops_base: 0, ops_com_litragem: 0 }; da.setores.set(atual.setor, ds); }
+        if (litros != null) { ds.litros += litros; if (ehBase) ds.litros_base += litros; ds.ops_com_litragem++; }
         ds.passagens++;
+        // a deduplicação por setor+dia acima garante uma passagem por OP, então
+        // a contagem de passagens do dia é a própria contagem de OPs no setor
+        ds.ops++;
+        if (ehBase) ds.ops_base++;
 
         // --- total da fábrica: cada lote conta uma vez por dia (independente de setores) ---
         if (LS_SETORES_PRODUTIVOS.has(atual.setor)) {
@@ -5113,8 +5129,11 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
       }
       if (computouAlgo) {
         diag.lotes_computados++;
-        densidadeFontes[densidade_fonte] = (densidadeFontes[densidade_fonte] || 0) + 1;
-        pesoFontes[peso_fonte] = (pesoFontes[peso_fonte] || 0) + 1;
+        if (litros != null) diag.lotes_computados_com_litragem++;
+        const dk = densidade_fonte || 'sem_densidade';
+        const pk = peso_fonte || 'sem_peso';
+        densidadeFontes[dk] = (densidadeFontes[dk] || 0) + 1;
+        pesoFontes[pk] = (pesoFontes[pk] || 0) + 1;
       } else {
         diag.sem_passagem_concluida++;
       }
@@ -5124,18 +5143,35 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
     const dias = Array.from(diaAgg.values()).sort((a, b) => a.dia.localeCompare(b.dia));
     const diario = dias.map(d => {
       const porSetor = {};
-      let litrosSetores = 0, baseSetores = 0;
+      let litrosSetores = 0, baseSetores = 0, opsSetores = 0, opsSetoresBase = 0;
       for (const [setor, v] of d.setores) {
-        porSetor[setor] = { litros: lsRound(v.litros), litros_base: lsRound(v.litros_base), passagens: v.passagens };
+        porSetor[setor] = {
+          litros: lsRound(v.litros),
+          litros_base: lsRound(v.litros_base),
+          litros_nao_base: lsRound(v.litros - v.litros_base),
+          passagens: v.passagens,
+          ops: v.ops,
+          ops_base: v.ops_base,
+          ops_nao_base: v.ops - v.ops_base,
+          ops_com_litragem: v.ops_com_litragem
+        };
         litrosSetores += v.litros;
         baseSetores += v.litros_base;
+        opsSetores += v.ops;
+        opsSetoresBase += v.ops_base;
       }
       const fd = fabricaDiaLotes.get(d.dia) || new Map();
-      let fabLitros = 0, fabBase = 0;
-      for (const v of fd.values()) { fabLitros += v.litros; if (v.base) fabBase += v.litros; }
+      let fabLitros = 0, fabBase = 0, fabOpsBase = 0;
+      for (const v of fd.values()) {
+        if (v.litros != null) { fabLitros += v.litros; if (v.base) fabBase += v.litros; }
+        if (v.base) fabOpsBase++;
+      }
       const fin = finalizadoDia.get(d.dia) || new Map();
-      let finLitros = 0, finBase = 0;
-      for (const v of fin.values()) { finLitros += v.litros; if (v.base) finBase += v.litros; }
+      let finLitros = 0, finBase = 0, finOpsBase = 0;
+      for (const v of fin.values()) {
+        if (v.litros != null) { finLitros += v.litros; if (v.base) finBase += v.litros; }
+        if (v.base) finOpsBase++;
+      }
       return {
         dia: d.dia,
         semana: d.semana,
@@ -5143,16 +5179,27 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         // soma das etapas concluídas no dia (um lote pode aparecer em vários setores)
         litros_setores: lsRound(litrosSetores),
         litros_setores_base: lsRound(baseSetores),
+        // soma das OPs atendidas em cada setor no dia (uma OP em 3 setores conta 3x)
+        ops_setores: opsSetores,
+        ops_setores_base: opsSetoresBase,
+        ops_setores_nao_base: opsSetores - opsSetoresBase,
         // litragem única da fábrica no dia (cada lote contado uma vez)
         litros_fabrica: lsRound(fabLitros),
         litros_fabrica_base: lsRound(fabBase),
         litros_fabrica_nao_base: lsRound(fabLitros - fabBase),
         lotes_fabrica: fd.size,
+        // OPs distintas que passaram por algum setor produtivo no dia
+        ops_fabrica: fd.size,
+        ops_fabrica_base: fabOpsBase,
+        ops_fabrica_nao_base: fd.size - fabOpsBase,
         // produção concluída no dia (lote chegou a pronto/entrega) — sem dupla contagem
         litros_finalizados: lsRound(finLitros),
         litros_finalizados_base: lsRound(finBase),
         litros_finalizados_nao_base: lsRound(finLitros - finBase),
         lotes_finalizados: fin.size,
+        ops_finalizadas: fin.size,
+        ops_finalizadas_base: finOpsBase,
+        ops_finalizadas_nao_base: fin.size - finOpsBase,
         por_setor: porSetor
       };
     });
@@ -5161,7 +5208,7 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
     const semanaMap = new Map();
     for (const d of diario) {
       let s = semanaMap.get(d.semana);
-      if (!s) { s = { semana: d.semana, inicio: d.dia, fim: d.dia, dias: [], litros_fabrica: 0, litros_fabrica_base: 0, litros_setores: 0, litros_finalizados: 0, litros_finalizados_base: 0 }; semanaMap.set(d.semana, s); }
+      if (!s) { s = { semana: d.semana, inicio: d.dia, fim: d.dia, dias: [], litros_fabrica: 0, litros_fabrica_base: 0, litros_setores: 0, litros_finalizados: 0, litros_finalizados_base: 0, ops_fabrica: 0, ops_fabrica_base: 0, ops_setores: 0, ops_setores_base: 0, ops_finalizadas: 0, ops_finalizadas_base: 0 }; semanaMap.set(d.semana, s); }
       s.dias.push(d.dia);
       s.inicio = s.inicio < d.dia ? s.inicio : d.dia;
       s.fim = s.fim > d.dia ? s.fim : d.dia;
@@ -5170,6 +5217,12 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
       s.litros_setores += d.litros_setores;
       s.litros_finalizados += d.litros_finalizados;
       s.litros_finalizados_base += d.litros_finalizados_base;
+      s.ops_fabrica += d.ops_fabrica;
+      s.ops_fabrica_base += d.ops_fabrica_base;
+      s.ops_setores += d.ops_setores;
+      s.ops_setores_base += d.ops_setores_base;
+      s.ops_finalizadas += d.ops_finalizadas;
+      s.ops_finalizadas_base += d.ops_finalizadas_base;
     }
     const semanal = Array.from(semanaMap.values())
       .sort((a, b) => a.semana.localeCompare(b.semana))
@@ -5182,22 +5235,33 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         litros_finalizados: lsRound(s.litros_finalizados),
         litros_finalizados_base: lsRound(s.litros_finalizados_base),
         litros_finalizados_nao_base: lsRound(s.litros_finalizados - s.litros_finalizados_base),
+        ops_fabrica_nao_base: s.ops_fabrica - s.ops_fabrica_base,
+        ops_setores_nao_base: s.ops_setores - s.ops_setores_base,
+        ops_finalizadas_nao_base: s.ops_finalizadas - s.ops_finalizadas_base,
         dias_com_producao: s.dias.length,
         media_diaria_fabrica: s.dias.length ? lsRound(s.litros_fabrica / s.dias.length) : 0,
-        media_diaria_finalizados: s.dias.length ? lsRound(s.litros_finalizados / s.dias.length) : 0
+        media_diaria_finalizados: s.dias.length ? lsRound(s.litros_finalizados / s.dias.length) : 0,
+        media_diaria_ops_fabrica: s.dias.length ? lsRound(s.ops_fabrica / s.dias.length) : 0,
+        media_diaria_ops_finalizadas: s.dias.length ? lsRound(s.ops_finalizadas / s.dias.length) : 0
       }));
 
     // ---- séries mensais ----
     const mesMap = new Map();
     for (const d of diario) {
       let m = mesMap.get(d.mes);
-      if (!m) { m = { mes: d.mes, dias: 0, litros_fabrica: 0, litros_fabrica_base: 0, litros_setores: 0, litros_finalizados: 0, litros_finalizados_base: 0 }; mesMap.set(d.mes, m); }
+      if (!m) { m = { mes: d.mes, dias: 0, litros_fabrica: 0, litros_fabrica_base: 0, litros_setores: 0, litros_finalizados: 0, litros_finalizados_base: 0, ops_fabrica: 0, ops_fabrica_base: 0, ops_setores: 0, ops_setores_base: 0, ops_finalizadas: 0, ops_finalizadas_base: 0 }; mesMap.set(d.mes, m); }
       m.dias++;
       m.litros_fabrica += d.litros_fabrica;
       m.litros_fabrica_base += d.litros_fabrica_base;
       m.litros_setores += d.litros_setores;
       m.litros_finalizados += d.litros_finalizados;
       m.litros_finalizados_base += d.litros_finalizados_base;
+      m.ops_fabrica += d.ops_fabrica;
+      m.ops_fabrica_base += d.ops_fabrica_base;
+      m.ops_setores += d.ops_setores;
+      m.ops_setores_base += d.ops_setores_base;
+      m.ops_finalizadas += d.ops_finalizadas;
+      m.ops_finalizadas_base += d.ops_finalizadas_base;
     }
     const mensal = Array.from(mesMap.values())
       .sort((a, b) => a.mes.localeCompare(b.mes))
@@ -5211,8 +5275,19 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         litros_finalizados: lsRound(m.litros_finalizados),
         litros_finalizados_base: lsRound(m.litros_finalizados_base),
         litros_finalizados_nao_base: lsRound(m.litros_finalizados - m.litros_finalizados_base),
+        ops_fabrica: m.ops_fabrica,
+        ops_fabrica_base: m.ops_fabrica_base,
+        ops_fabrica_nao_base: m.ops_fabrica - m.ops_fabrica_base,
+        ops_setores: m.ops_setores,
+        ops_setores_base: m.ops_setores_base,
+        ops_setores_nao_base: m.ops_setores - m.ops_setores_base,
+        ops_finalizadas: m.ops_finalizadas,
+        ops_finalizadas_base: m.ops_finalizadas_base,
+        ops_finalizadas_nao_base: m.ops_finalizadas - m.ops_finalizadas_base,
         media_diaria_fabrica: m.dias ? lsRound(m.litros_fabrica / m.dias) : 0,
-        media_diaria_finalizados: m.dias ? lsRound(m.litros_finalizados / m.dias) : 0
+        media_diaria_finalizados: m.dias ? lsRound(m.litros_finalizados / m.dias) : 0,
+        media_diaria_ops_fabrica: m.dias ? lsRound(m.ops_fabrica / m.dias) : 0,
+        media_diaria_ops_finalizadas: m.dias ? lsRound(m.ops_finalizadas / m.dias) : 0
       }));
 
     // ---- capacidade média diária por setor ----
@@ -5225,12 +5300,26 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         litros_base: lsRound(s.litros_base),
         litros_nao_base: lsRound(s.litros - s.litros_base),
         passagens: s.passagens,
+        passagens_base: s.passagens_base,
+        passagens_nao_base: s.passagens - s.passagens_base,
         passagens_mesmo_dia: s.passagens_mesmo_dia,
         lotes: s.lotes.size,
+        lotes_base: s.lotesBase.size,
+        lotes_nao_base: s.lotes.size - s.lotesBase.size,
+        // OPs atendidas: cada passagem computada é uma OP-dia distinta no setor
+        ops_total: s.passagens,
+        ops_base: s.passagens_base,
+        ops_nao_base: s.passagens - s.passagens_base,
         dias_com_producao: s.dias.size,
-        // média diária considerando apenas os dias em que o setor produziu
-        media_diaria: s.dias.size ? lsRound(s.litros / s.dias.size) : 0,
-        media_diaria_base: s.dias.size ? lsRound(s.litros_base / s.dias.size) : 0,
+        // dias em que houve litragem calculável (lotes sem peso/densidade não entram)
+        dias_com_litragem: s.diasLitros.size,
+        // média diária de litros usa só os dias com litragem apurada, para não diluir
+        media_diaria: s.diasLitros.size ? lsRound(s.litros / s.diasLitros.size) : 0,
+        media_diaria_base: s.diasLitros.size ? lsRound(s.litros_base / s.diasLitros.size) : 0,
+        // média diária de OPs usa todos os dias em que o setor teve movimento
+        media_ops_dia: s.dias.size ? lsRound(s.passagens / s.dias.size) : 0,
+        media_ops_dia_base: s.dias.size ? lsRound(s.passagens_base / s.dias.size) : 0,
+        media_ops_dia_nao_base: s.dias.size ? lsRound((s.passagens - s.passagens_base) / s.dias.size) : 0,
         media_litros_por_passagem: s.passagens ? lsRound(s.litros / s.passagens) : 0
       }))
       .sort((a, b) => b.litros_total - a.litros_total);
@@ -5242,6 +5331,14 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
     const totalFinalizados = diario.reduce((acc, d) => acc + d.litros_finalizados, 0);
     const totalFinalizadosBase = diario.reduce((acc, d) => acc + d.litros_finalizados_base, 0);
     const diasFinalizados = diario.filter(d => d.litros_finalizados > 0).length;
+
+    const totalOpsFabrica = diario.reduce((acc, d) => acc + d.ops_fabrica, 0);
+    const totalOpsFabricaBase = diario.reduce((acc, d) => acc + d.ops_fabrica_base, 0);
+    const totalOpsSetores = diario.reduce((acc, d) => acc + d.ops_setores, 0);
+    const totalOpsSetoresBase = diario.reduce((acc, d) => acc + d.ops_setores_base, 0);
+    const totalOpsFinalizadas = diario.reduce((acc, d) => acc + d.ops_finalizadas, 0);
+    const totalOpsFinalizadasBase = diario.reduce((acc, d) => acc + d.ops_finalizadas_base, 0);
+    const diasComOpsFinalizadas = diario.filter(d => d.ops_finalizadas > 0).length;
 
     return res.json({
       ok: true,
@@ -5259,7 +5356,10 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         setores_produtivos: Array.from(LS_SETORES_PRODUTIVOS),
         setores_apoio: Array.from(LS_SETORES_APOIO),
         litros_fabrica: 'cada lote conta uma vez por dia, somando apenas setores produtivos',
-        litros_setores: 'soma de todas as etapas concluídas no dia (um lote pode aparecer em mais de um setor)'
+        litros_setores: 'soma de todas as etapas concluídas no dia (um lote pode aparecer em mais de um setor)',
+        ops: 'uma OP conta uma vez por setor por dia; lotes sem peso ou densidade contam como OP e ficam de fora apenas da litragem',
+        ops_fabrica: 'OPs distintas que passaram por algum setor produtivo no dia',
+        ops_finalizadas: 'OPs que chegaram a pronto/entrega no dia — cada OP conta uma única vez em todo o período'
       },
       resumo: {
         total_litros_fabrica: lsRound(totalFabrica),
@@ -5282,7 +5382,26 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
         media_mensal_fabrica: mensal.length ? lsRound(totalFabrica / mensal.length) : 0,
         lotes_computados: diag.lotes_computados,
         passagens_computadas: diag.passagens_computadas,
-        percentual_base: totalFabrica > 0 ? lsRound((totalFabricaBase / totalFabrica) * 100) : 0
+        percentual_base: totalFabrica > 0 ? lsRound((totalFabricaBase / totalFabrica) * 100) : 0,
+
+        // ---- indicadores de quantidade de OPs ----
+        total_ops_fabrica: totalOpsFabrica,
+        total_ops_fabrica_base: totalOpsFabricaBase,
+        total_ops_fabrica_nao_base: totalOpsFabrica - totalOpsFabricaBase,
+        total_ops_setores: totalOpsSetores,
+        total_ops_setores_base: totalOpsSetoresBase,
+        total_ops_setores_nao_base: totalOpsSetores - totalOpsSetoresBase,
+        total_ops_finalizadas: totalOpsFinalizadas,
+        total_ops_finalizadas_base: totalOpsFinalizadasBase,
+        total_ops_finalizadas_nao_base: totalOpsFinalizadas - totalOpsFinalizadasBase,
+        dias_com_ops_finalizadas: diasComOpsFinalizadas,
+        media_diaria_ops_fabrica: diario.length ? lsRound(totalOpsFabrica / diario.length) : 0,
+        media_diaria_ops_fabrica_base: diario.length ? lsRound(totalOpsFabricaBase / diario.length) : 0,
+        media_diaria_ops_setores: diario.length ? lsRound(totalOpsSetores / diario.length) : 0,
+        media_diaria_ops_finalizadas: diasComOpsFinalizadas ? lsRound(totalOpsFinalizadas / diasComOpsFinalizadas) : 0,
+        media_semanal_ops_fabrica: semanal.length ? lsRound(totalOpsFabrica / semanal.length) : 0,
+        media_mensal_ops_fabrica: mensal.length ? lsRound(totalOpsFabrica / mensal.length) : 0,
+        percentual_ops_base: totalOpsFabrica > 0 ? lsRound((totalOpsFabricaBase / totalOpsFabrica) * 100) : 0
       },
       setores,
       diario,
