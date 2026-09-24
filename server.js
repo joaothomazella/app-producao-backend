@@ -1220,9 +1220,15 @@ function rtSumWorkSessionsBySector(workSessions, sector, enteredAt, leftAt, shif
     }
   }
 
-  const closedIntervals = rtGetClosedIntervalsForSector(shiftClosedMap, sector, startLimit, endLimit);
-  const mergedPauses = rtSubtractIntervals(rtMergeIntervals(pauseIntervals), closedIntervals);
-  const effectiveWorkIntervals = rtSubtractIntervals(rtSubtractIntervals(workIntervals, mergedPauses), closedIntervals);
+  // Trabalhado e pausado precisam ser medidos na MESMA régua do total: só conta o que
+  // caiu dentro do expediente aberto. Antes aqui só subtraíamos os fechamentos explícitos,
+  // enquanto o total usava rtBusinessIntervals (que também intersecta com os períodos
+  // abertos). Quando a régua de aberto era mais restrita que a de fechado, o trabalhado
+  // vinha maior que o total e o clamp lá na frente o truncava — o card mostrava trabalhado
+  // "roubando" o total inteiro e o ocioso zerava sem motivo.
+  const businessIntervals = rtBusinessIntervals(startLimit, endLimit, sector, shiftClosedMap);
+  const mergedPauses = rtIntersectIntervals(rtMergeIntervals(pauseIntervals), businessIntervals);
+  const effectiveWorkIntervals = rtIntersectIntervals(rtSubtractIntervals(workIntervals, mergedPauses), businessIntervals);
 
   return {
     workedMs: workedDirectMs + rtIntervalsTotalMs(effectiveWorkIntervals),
@@ -1794,6 +1800,88 @@ function rtBuildTempoRowsFromLot(row, setorFiltro = '', shiftClosedMap = {}) {
       motivo_pausa: rtCollectTempoRowTexts(row, metric, 'pause'),
       id_lote: row.id || null
     }));
+}
+
+// ─────────────────────────────────────────────────────────────
+// TEMPO DO SETOR ATUAL PARA OS CARDS DO KANBAN
+//
+// Os cards calculavam o tempo no próprio navegador, com relógio de parede
+// (agora - ff_sectorEnteredAt). Resultado: uma OP parada desde junho aparecia
+// com ~2.300h no card enquanto o Relatório de Tempos, que desconta expediente
+// fechado, mostrava ~574h para a mesma OP. Agora o card recebe o tempo já
+// calculado por este motor, o MESMO usado pelo relatório, então os dois números
+// são iguais por construção.
+// ─────────────────────────────────────────────────────────────
+let _shiftMapCache = null;
+let _shiftMapCacheAt = 0;
+let _shiftMapPromise = null;
+const _SHIFT_MAP_TTL = 10000;
+
+async function rtGetShiftClosedIntervalsCached() {
+  if (_shiftMapCache && (Date.now() - _shiftMapCacheAt) < _SHIFT_MAP_TTL) return _shiftMapCache;
+  if (!_shiftMapPromise) {
+    _shiftMapPromise = (async () => {
+      try {
+        const map = await rtLoadShiftClosedIntervals();
+        _shiftMapCache = map;
+        _shiftMapCacheAt = Date.now();
+        return map;
+      } finally {
+        _shiftMapPromise = null;
+      }
+    })();
+  }
+  return _shiftMapPromise;
+}
+
+function rtIsExpedienteAbertoNoMapa(shiftClosedMap, sector) {
+  const key = rtGetShiftKeyForSector(sector);
+  const state = shiftClosedMap?.__state?.[key];
+  if (state && state.isOpen != null) return !!state.isOpen;
+  for (const gk of rtGetGlobalShiftKeys()) {
+    const gs = shiftClosedMap?.__state?.[gk];
+    if (gs && gs.isOpen != null) return !!gs.isOpen;
+  }
+  // Sem registro de expediente o setor é tratado como aberto — é como o
+  // rtBusinessIntervals se comporta quando não há intervalo nenhum no mapa.
+  return true;
+}
+
+function rtBuildTempoSetorAtual(row, shiftClosedMap = {}) {
+  try {
+    const setorAtual = String(row?.setor_atual || row?.status || '').trim();
+    if (!setorAtual) return null;
+
+    const linhas = rtBuildTempoRowsFromLot(row, '', shiftClosedMap);
+    if (!linhas.length) return null;
+
+    const setorNorm = rtNormalizeText(setorAtual);
+    const emAndamento = linhas.filter(l => l.status === 'Em andamento' && rtNormalizeText(l.setor) === setorNorm);
+    const candidatas = emAndamento.length
+      ? emAndamento
+      : linhas.filter(l => rtNormalizeText(l.setor) === setorNorm);
+    if (!candidatas.length) return null;
+
+    // A passagem que vale é sempre a última pelo setor atual.
+    const atual = candidatas.reduce((a, b) => (Number(b.enteredAt || 0) >= Number(a.enteredAt || 0) ? b : a));
+
+    return {
+      setor: atual.setor,
+      enteredAt: atual.enteredAt || null,
+      totalMs: atual.totalMs,
+      workedMs: atual.workedMs,
+      pausedMs: atual.pausedMs,
+      idleMs: atual.idleMs,
+      efficiency: atual.efficiency,
+      status: atual.status,
+      expedienteAberto: rtIsExpedienteAbertoNoMapa(shiftClosedMap, atual.setor),
+      asOf: Date.now(),
+      fonte: 'backend_expediente'
+    };
+  } catch (err) {
+    console.warn('[tempos] não foi possível calcular o tempo do setor atual do lote', row?.id, err.message);
+    return null;
+  }
 }
 
 async function getProductionLoteByOp(op) {
@@ -4110,6 +4198,13 @@ app.get('/api/producao/ativos', async (req, res) => {
           `,
           [limit]
         );
+
+        // Cada lote já sai daqui com o tempo do setor atual calculado pelo mesmo motor
+        // do Relatório de Tempos (ff_tempoSetor), para o card não precisar recalcular
+        // no navegador e divergir do relatório.
+        const shiftClosedMap = await rtGetShiftClosedIntervalsCached();
+        for (const row of rows) row.ff_tempoSetor = rtBuildTempoSetorAtual(row, shiftClosedMap);
+
         const result = { ok: true, total: rows.length, limit, mode: 'fast', data: rows };
         _ativosCache = result;
         _ativosCacheAt = Date.now();
@@ -4463,12 +4558,25 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
       conditions.push('(setor_atual LIKE ? OR ff_sectorMetrics LIKE ? OR ff_history LIKE ?)');
       params.push(`%${setor}%`, `%${setor}%`, `%${setor}%`);
     }
+    // Um lote entra na janela quando a PASSAGEM dele pelo setor cruza o período pedido,
+    // não quando a última atualização do lote cai lá dentro. Filtrar o fim por updated_at
+    // descartava o lote inteiro sempre que ele continuou andando depois da data final —
+    // uma OP que passou pela coloração em janeiro e só foi entregue em fevereiro sumia de
+    // um relatório de janeiro. O teste certo é de sobreposição: o lote precisa ter nascido
+    // até o fim da janela e ainda estar vivo depois do início dela.
     if (inicio) { conditions.push('DATE(COALESCE(updated_at, data_criacao)) >= ?'); params.push(inicio); }
-    if (fim) { conditions.push('DATE(COALESCE(updated_at, data_criacao)) <= ?'); params.push(fim); }
+    if (fim) { conditions.push('DATE(COALESCE(data_criacao, updated_at)) <= ?'); params.push(fim); }
 
     const hasAnyUserFilter = Boolean(codigos.length || produto || op || pedido || cliente || setor || inicio || fim);
-    if (!hasAnyUserFilter) {
-      conditions.push('COALESCE(updated_at, data_criacao) >= DATE_SUB(NOW(), INTERVAL 30 DAY)');
+
+    // Sem nenhum filtro o relatório se limita a uma janela recente para não varrer a base
+    // inteira. Agora a janela é explícita: ?dias=N muda o tamanho e ?todos=1 traz tudo.
+    const todos = ['1', 'true', 'sim'].includes(String(req.query.todos || '').trim().toLowerCase());
+    const dias = Math.min(Math.max(toPositiveInt(req.query.dias, 30), 1), 3650);
+    const aplicouJanelaPadrao = !hasAnyUserFilter && !todos;
+    if (aplicouJanelaPadrao) {
+      conditions.push('COALESCE(updated_at, data_criacao) >= DATE_SUB(NOW(), INTERVAL ? DAY)');
+      params.push(dias);
     }
 
     const where = conditions.length ? `WHERE ${conditions.join(' AND ')}` : '';
@@ -4501,7 +4609,7 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
       [...params, limit, offset]
     );
 
-    const shiftClosedMap = await rtLoadShiftClosedIntervals();
+    const shiftClosedMap = await rtGetShiftClosedIntervalsCached();
 
     let data = [];
     for (const lote of lotes) data.push(...rtBuildTempoRowsFromLot(lote, setor, shiftClosedMap));
@@ -4541,7 +4649,11 @@ app.get('/api/producao/relatorio-tempos', async (req, res) => {
         setor: setor || null,
         inicio: inicio || null,
         fim: fim || null,
-        default_ultimos_30_dias: !hasAnyUserFilter
+        todos,
+        dias: aplicouJanelaPadrao ? dias : null,
+        janela_padrao_aplicada: aplicouJanelaPadrao,
+        // Mantido pelo nome antigo para não quebrar quem já lia este campo.
+        default_ultimos_30_dias: aplicouJanelaPadrao && dias === 30
       },
       resumo: {
         totalLinhas: data.length,
@@ -5932,8 +6044,15 @@ app.get('/api/producao', async (req, res) => {
       [...params, limit, offset]
     );
 
+    // Esta rota é o fallback do kanban quando /api/producao/ativos falha.
+    // Sem o ff_tempoSetor aqui o card voltaria a calcular tempo de relógio de parede
+    // no navegador e divergiria do Relatório de Tempos.
+    const shiftClosedMap = await rtGetShiftClosedIntervalsCached();
+
     const data = rows.map((row) => ({
       ...row,
+
+      ff_tempoSetor: rtBuildTempoSetorAtual(row, shiftClosedMap),
 
       // Compatibilidade com o front:
       // data.js procura estes nomes.
