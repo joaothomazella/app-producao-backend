@@ -3992,6 +3992,9 @@ async function criarLoteManual(req, res) {
       ]
     );
 
+    // Lote novo entrou na lista: o cache de listagem não pode escondê-lo.
+    ffInvalidateLotCaches();
+
     const [rows] = await dbPool.query(
       `SELECT * FROM producao_lotes WHERE id = ? LIMIT 1`,
       [result.insertId]
@@ -4125,6 +4128,23 @@ let _ativosCacheAt = 0;
 let _ativosPromise = null;
 const _ATIVOS_TTL = 8000;
 
+// Geração do cache de lotes.
+// Toda escrita em producao_lotes incrementa este contador e zera os caches.
+// Sem isto, quem avançava um lote de setor continuava recebendo a versão antiga
+// por até 8s (/ativos) ou 12s (/producao) — o front recarregava 800ms depois da
+// gravação, caía no cache velho e o card voltava para a coluna anterior,
+// obrigando o usuário a atualizar a página na mão.
+let _lotCacheGen = 0;
+
+function ffInvalidateLotCaches() {
+  _lotCacheGen++;
+  _ativosCache = null;
+  _ativosCacheAt = 0;
+  _producaoCache = null;
+  _producaoCacheAt = 0;
+  return _lotCacheGen;
+}
+
 app.get('/api/producao/ativos', async (req, res) => {
   // Cache de 8s — todas as requisições paralelas recebem o mesmo resultado sem bater no banco.
   if (_ativosCache && (Date.now() - _ativosCacheAt) < _ATIVOS_TTL) {
@@ -4134,6 +4154,9 @@ app.get('/api/producao/ativos', async (req, res) => {
   // Deduplicação: se a query já está rodando, aguarda o mesmo resultado em vez de disparar outra.
   if (!_ativosPromise) {
     const limit = Math.min(Math.max(toPositiveInt(req.query.limit, 300), 1), 500);
+    // Geração no início da query: se alguém gravar um lote enquanto ela roda,
+    // o resultado já nasce velho e não pode virar cache.
+    const genAtStart = _lotCacheGen;
     _ativosPromise = (async () => {
       try {
         const [rows] = await dbPool.query(
@@ -4206,8 +4229,10 @@ app.get('/api/producao/ativos', async (req, res) => {
         for (const row of rows) row.ff_tempoSetor = rtBuildTempoSetorAtual(row, shiftClosedMap);
 
         const result = { ok: true, total: rows.length, limit, mode: 'fast', data: rows };
-        _ativosCache = result;
-        _ativosCacheAt = Date.now();
+        if (genAtStart === _lotCacheGen) {
+          _ativosCache = result;
+          _ativosCacheAt = Date.now();
+        }
         return result;
       } finally {
         _ativosPromise = null;
@@ -5801,6 +5826,8 @@ app.post('/api/admin/reprocessar-tempos', async (req, res) => {
       }
     }
 
+    if (!dryRun && updated > 0) ffInvalidateLotCaches();
+
     return res.json({
       ok: true,
       modo: dryRun ? 'DRY_RUN_SEM_ALTERAR_BANCO' : 'APLICADO_NO_BANCO',
@@ -5843,6 +5870,9 @@ app.get('/api/producao', async (req, res) => {
   if (!hasFilters && _producaoCache && (Date.now() - _producaoCacheAt) < _PRODUCAO_TTL) {
     return res.json(_producaoCache);
   }
+
+  // Se um lote for gravado enquanto a query roda, o resultado não vira cache.
+  const genAtStart = _lotCacheGen;
 
   try {
     const hasProducaoLotes = await tableExists('producao_lotes');
@@ -6075,7 +6105,7 @@ app.get('/api/producao', async (req, res) => {
 
     const result = { ok: true, total: Number(total), limit, offset, data };
 
-    if (!hasFilters) {
+    if (!hasFilters && genAtStart === _lotCacheGen) {
       _producaoCache = result;
       _producaoCacheAt = Date.now();
     }
@@ -6161,6 +6191,10 @@ app.patch('/api/producao/:id', async (req, res) => {
     if (!result.affectedRows) {
       return sendError(res, 404, 'Lote não encontrado');
     }
+
+    // O lote mudou: derruba os caches de listagem ANTES de responder, senão o
+    // front recarrega logo em seguida e recebe o setor antigo de volta.
+    ffInvalidateLotCaches();
 
     const [rows] = await dbPool.query(
       'SELECT * FROM producao_lotes WHERE id = ? LIMIT 1',
@@ -6366,6 +6400,12 @@ app.post('/api/expediente/toggle', async (req, res) => {
       `SELECT * FROM ff_sector_shifts WHERE setor = ? LIMIT 1`,
       [setor]
     );
+
+    // Abrir/fechar expediente muda o tempo útil de todo mundo: o mapa de
+    // expediente e os caches de lote precisam ser refeitos na próxima leitura.
+    _shiftMapCache = null;
+    _shiftMapCacheAt = 0;
+    ffInvalidateLotCaches();
 
     res.json({ ok: true, unchanged: false, data: ffFixShiftRowDates(rows[0]) });
     } finally {
