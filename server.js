@@ -3251,6 +3251,77 @@ app.get('/api/materias-primas/:codigo', async (req, res) => {
 // PRODUTOS REAIS DA EMPRESA
 // =========================
 
+// Busca exata de um produto pelo código, para preencher o nome automaticamente
+// na criação de lote manual.
+// Diferente de /api/produtos, aqui NÃO aplicamos o filtro de grupo: se o código
+// existe no cadastro, o nome tem que vir — quem digitou o código sabe o que quer.
+app.get('/api/produtos/lookup', async (req, res) => {
+  try {
+    const codigo = String(req.query.codigo || req.query.code || '').trim();
+    if (!codigo) return sendError(res, 400, 'Informe o código do produto');
+
+    // Compara também sem zeros à esquerda: o cadastro tem código com e sem eles.
+    const [rows] = await dbPool.query(
+      `
+        SELECT
+          pro_codigo AS codigo,
+          pro_nome AS nome,
+          pro_grupo_nome AS grupo_nome,
+          COALESCE(NULLIF(TRIM(pro_linha), ''), '') AS linha
+        FROM cli_produtos
+        WHERE TRIM(pro_codigo) = ?
+           OR TRIM(LEADING '0' FROM TRIM(pro_codigo)) = TRIM(LEADING '0' FROM ?)
+        ORDER BY (TRIM(pro_codigo) = ?) DESC
+        LIMIT 1
+      `,
+      [codigo, codigo, codigo]
+    );
+
+    if (rows.length) {
+      const p = rows[0];
+      // Alguns cadastros têm pro_nome só com um ponto ou um número solto;
+      // nesses casos o nome que presta está no grupo.
+      const nome = String(p.nome || '').trim();
+      return res.json({
+        ok: true,
+        encontrado: true,
+        data: {
+          ...p,
+          nome: nome.length >= 3 ? nome : (String(p.grupo_nome || '').trim() || nome),
+          fonte: 'cli_produtos'
+        }
+      });
+    }
+
+    // Código que não está no cadastro de produtos mas já foi usado em pedido:
+    // o nome que o ERP imprimiu no pedido serve.
+    const [itens] = await dbPool.query(
+      `
+        SELECT TRIM(pits_produto) AS codigo, MAX(pits_nome_produto) AS nome
+        FROM cli_pedidos_itens
+        WHERE TRIM(pits_produto) = ?
+           OR TRIM(LEADING '0' FROM TRIM(pits_produto)) = TRIM(LEADING '0' FROM ?)
+        GROUP BY TRIM(pits_produto)
+        LIMIT 1
+      `,
+      [codigo, codigo]
+    );
+
+    if (itens.length && String(itens[0].nome || '').trim()) {
+      return res.json({
+        ok: true,
+        encontrado: true,
+        data: { codigo: itens[0].codigo, nome: String(itens[0].nome).trim(), grupo_nome: '', linha: '', fonte: 'cli_pedidos_itens' }
+      });
+    }
+
+    return res.json({ ok: true, encontrado: false, data: null });
+  } catch (err) {
+    console.error('GET /api/produtos/lookup erro:', err.message);
+    sendError(res, 500, 'Erro ao buscar produto pelo código', err.message);
+  }
+});
+
 app.get('/api/produtos', async (req, res) => {
   try {
     const search = req.query.search ? `%${req.query.search}%` : null;
@@ -4172,10 +4243,13 @@ app.get('/api/producao/ativos', async (req, res) => {
               COALESCE(NULLIF(pl.quantidade, 0), erp.pits_peso, erp.pits_qtde, 0) AS quantidade,
               erp.pits_qtde,
               erp.pits_peso,
-              COALESCE(fpd.data_entrega, erp.pits_previsao) AS pits_previsao,
-              COALESCE(fpd.data_entrega, erp.pits_previsao) AS deliveryDate,
-              COALESCE(fpd.data_entrega, erp.pits_previsao) AS previsao_entrega,
-              COALESCE(fpd.data_entrega, erp.pits_previsao) AS data_entrega,
+              -- pl.previsao_entrega no fim da lista: lote manual não tem linha no ERP,
+              -- então sem isto a data digitada na criação sumia e o pedido nunca
+              -- aparecia na Programação de Entregas.
+              COALESCE(fpd.data_entrega, erp.pits_previsao, pl.previsao_entrega) AS pits_previsao,
+              COALESCE(fpd.data_entrega, erp.pits_previsao, pl.previsao_entrega) AS deliveryDate,
+              COALESCE(fpd.data_entrega, erp.pits_previsao, pl.previsao_entrega) AS previsao_entrega,
+              COALESCE(fpd.data_entrega, erp.pits_previsao, pl.previsao_entrega) AS data_entrega,
               fpd.data_entrega AS data_entrega_override,
               COALESCE(NULLIF(TRIM(pl.cliente_endereco), ''), c.cli_endereco, '') AS cliente_endereco,
               COALESCE(NULLIF(TRIM(pl.cliente_bairro), ''), c.cli_bairro, '') AS cliente_bairro,
