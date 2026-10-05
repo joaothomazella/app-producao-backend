@@ -302,6 +302,18 @@ async function runSync() {
   syncStats.lastRunAt = new Date().toISOString();
   syncStats.lastError = null;
 
+  // O sync grava direto em producao_lotes, sem passar pelas rotas, então ele
+  // precisa avisar quem mantém cache de listagem. Sem isto um pedido recém
+  // importado do ERP podia levar até o TTL do cache (12 s) para aparecer na
+  // tela. Antes isto não aparecia porque a listagem com filtro não cacheava.
+  if (inserted > 0 || updated > 0) {
+    try {
+      if (typeof _onLotsChanged === 'function') _onLotsChanged();
+    } catch (err) {
+      console.error('sync: aviso de mudança de lote falhou:', err.message);
+    }
+  }
+
   if (rows.length > 0 || inserted > 0 || updated > 0) {
     console.log(
       `🔄 Sync concluído | lidos: ${rows.length} | inseridos: ${inserted} | atualizados: ${updated} | último id: ${lastImportedId}`
@@ -358,8 +370,16 @@ function getSyncStats() {
   };
 }
 
+// Quem tem cache de listagem de lote registra aqui. Fica opcional de propósito:
+// se ninguém registrar, o sync funciona exatamente como antes.
+let _onLotsChanged = null;
+function setOnLotsChanged(fn) {
+  _onLotsChanged = typeof fn === 'function' ? fn : null;
+}
+
 module.exports = {
   runSync,
   startSync,
   getSyncStats,
+  setOnLotsChanged,
 };

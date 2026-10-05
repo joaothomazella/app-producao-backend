@@ -8,7 +8,7 @@ const express = require('express');
 const compression = require('compression');
 const cors = require('cors');
 const { testConnection, dbPool } = require('./db');
-const { startSync, getSyncStats, runSync } = require('./sync');
+const { startSync, getSyncStats, runSync, setOnLotsChanged } = require('./sync');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
@@ -4245,6 +4245,9 @@ function ffInvalidateLotCaches() {
   _producaoCache.clear();
   return _lotCacheGen;
 }
+
+// O sync grava em producao_lotes por fora das rotas, então ele avisa aqui.
+setOnLotsChanged(ffInvalidateLotCaches);
 
 app.get('/api/producao/ativos', async (req, res) => {
   // Cache de 8s — todas as requisições paralelas recebem o mesmo resultado sem bater no banco.
