@@ -4242,8 +4242,7 @@ function ffInvalidateLotCaches() {
   _lotCacheGen++;
   _ativosCache = null;
   _ativosCacheAt = 0;
-  _producaoCache = null;
-  _producaoCacheAt = 0;
+  _producaoCache.clear();
   return _lotCacheGen;
 }
 
@@ -5965,29 +5964,72 @@ app.post('/api/admin/reprocessar-tempos', async (req, res) => {
 
 
 
-// Cache simples para /api/producao — evita múltiplas queries pesadas simultâneas.
-let _producaoCache = null;
-let _producaoCacheAt = 0;
+// Cache de /api/producao — evita múltiplas queries pesadas simultâneas.
+//
+// Antes a chave era "não tem filtro nenhum": qualquer requisição com status,
+// setor ou search passava direto para o banco e nunca gravava cache. A Entregas
+// sempre manda setor, então ela era exatamente o caso que nunca cacheava — e
+// essa query, com os 5 JOIN, é a mais cara do sistema. Agora a chave é a
+// combinação de filtros, então cada tela reaproveita o próprio resultado.
+//
+// _producaoInflight junta requisições paralelas idênticas numa só ida ao banco,
+// como /api/producao/ativos já fazia. Sem isso, duas abas abrindo a Entregas ao
+// mesmo tempo disparavam duas vezes a mesma query de 30 s.
+const _producaoCache = new Map();
+const _producaoInflight = new Map();
 const _PRODUCAO_TTL = 12000;
+const _PRODUCAO_CACHE_MAX = 24;
+
+// Usa os valores já normalizados (limit com teto, offset inteiro) para que
+// ?limit=9999 e ?limit=2000 caiam na mesma entrada, que é o mesmo resultado.
+function _producaoCacheKey(q) {
+  return JSON.stringify([
+    q.status || '',
+    q.setor || '',
+    q.search || '',
+    Math.min(toPositiveInt(q.limit, 500), 2000),
+    toPositiveInt(q.offset, 0)
+  ]);
+}
 
 app.get('/api/producao', async (req, res) => {
-  const hasFilters = req.query.status || req.query.setor || req.query.search;
-  if (!hasFilters && _producaoCache && (Date.now() - _producaoCacheAt) < _PRODUCAO_TTL) {
-    return res.json(_producaoCache);
+  const cacheKey = _producaoCacheKey(req.query);
+  const cached = _producaoCache.get(cacheKey);
+  if (cached && (Date.now() - cached.at) < _PRODUCAO_TTL) {
+    return res.json(cached.result);
   }
 
+  let inflight = _producaoInflight.get(cacheKey);
+  if (!inflight) {
+    inflight = _producaoQuery(req.query, cacheKey);
+    _producaoInflight.set(cacheKey, inflight);
+  }
+
+  try {
+    return res.json(await inflight);
+  } catch (err) {
+    if (err && err.ffStatus) {
+      return sendError(res, err.ffStatus, err.message, err.ffHint);
+    }
+    console.error('GET /api/producao erro:', err.message);
+    return sendError(res, 500, 'Erro ao buscar lotes de produção', err.message);
+  }
+});
+
+async function _producaoQuery(query, cacheKey) {
   // Se um lote for gravado enquanto a query roda, o resultado não vira cache.
   const genAtStart = _lotCacheGen;
 
   try {
+    const req = { query };
     const hasProducaoLotes = await tableExists('producao_lotes');
     if (!hasProducaoLotes) {
-      return sendError(
-        res,
-        404,
-        'Tabela producao_lotes não encontrada',
-        'Crie a tabela producao_lotes ou ajuste o nome da tabela no backend.'
-      );
+      // Mesma resposta de antes (404 + dica); vira exceção só porque quem
+      // responde agora é o handler, não esta função.
+      const e = new Error('Tabela producao_lotes não encontrada');
+      e.ffStatus = 404;
+      e.ffHint = 'Crie a tabela producao_lotes ou ajuste o nome da tabela no backend.';
+      throw e;
     }
 
     const limit = Math.min(toPositiveInt(req.query.limit, 500), 2000);
@@ -6138,14 +6180,24 @@ app.get('/api/producao', async (req, res) => {
 
         FROM producao_lotes pl
 
+        -- TRIM removido das comparacoes (05/10/2026). Verificado no banco real:
+        -- 0 linhas diferem do proprio TRIM em ff_pedidos_datas.pedido,
+        -- producao_lotes.numero_pedido, producao_lotes.op,
+        -- cli_pedidos_itens.pits_op e cli_pedidos_itens.pits_numero. Entao o
+        -- pareamento e identico, mas eram ~16 milhoes de chamadas de funcao por
+        -- consulta da Entregas (2000 lotes x 4043 itens x 2 lados) e TRIM na
+        -- coluna impede qualquer uso de indice. As collations batem nas duas
+        -- pontas (utf8_unicode_ci), nao precisa de COLLATE explicito.
+        -- O CAST(... AS UNSIGNED) de cli_codigo FICA: nao foi possivel provar
+        -- que sai sem mudar pareamento (zero a esquerda em varchar(5)).
         LEFT JOIN ff_pedidos_datas fpd
-          ON TRIM(fpd.pedido) = TRIM(pl.numero_pedido)
+          ON fpd.pedido = pl.numero_pedido
 
         LEFT JOIN cli_pedidos_itens pi_op
-          ON TRIM(pi_op.pits_op) = TRIM(pl.op)
+          ON pi_op.pits_op = pl.op
 
         LEFT JOIN cli_clientes c_op
-          ON CAST(TRIM(c_op.cli_codigo) AS UNSIGNED) = CAST(TRIM(pi_op.pits_cliente) AS UNSIGNED)
+          ON CAST(c_op.cli_codigo AS UNSIGNED) = CAST(pi_op.pits_cliente AS UNSIGNED)
 
         LEFT JOIN (
           SELECT
@@ -6160,10 +6212,10 @@ app.get('/api/producao', async (req, res) => {
             AND pits_numero <> ''
           GROUP BY pits_numero
         ) pi_pedido
-          ON TRIM(pi_pedido.pits_numero) = TRIM(pl.numero_pedido)
+          ON pi_pedido.pits_numero = pl.numero_pedido
 
         LEFT JOIN cli_clientes c_pedido
-          ON CAST(TRIM(c_pedido.cli_codigo) AS UNSIGNED) = CAST(TRIM(pi_pedido.pits_cliente) AS UNSIGNED)
+          ON CAST(c_pedido.cli_codigo AS UNSIGNED) = CAST(pi_pedido.pits_cliente AS UNSIGNED)
 
         ${where.replace(/\bstatus\b/g, 'pl.status')
                .replace(/\bsetor_atual\b/g, 'pl.setor_atual')
@@ -6210,17 +6262,20 @@ app.get('/api/producao', async (req, res) => {
 
     const result = { ok: true, total: Number(total), limit, offset, data };
 
-    if (!hasFilters && genAtStart === _lotCacheGen) {
-      _producaoCache = result;
-      _producaoCacheAt = Date.now();
+    if (genAtStart === _lotCacheGen) {
+      if (!_producaoCache.has(cacheKey) && _producaoCache.size >= _PRODUCAO_CACHE_MAX) {
+        _producaoCache.delete(_producaoCache.keys().next().value);
+      }
+      _producaoCache.set(cacheKey, { at: Date.now(), result });
     }
 
-    res.json(result);
-  } catch (err) {
-    console.error('GET /api/producao erro:', err.message);
-    sendError(res, 500, 'Erro ao buscar lotes de produção', err.message);
+    return result;
+  } finally {
+    // Sai do inflight sempre, inclusive quando deu erro: senão um erro
+    // transitório ficaria colado na chave e todo mundo receberia ele de novo.
+    _producaoInflight.delete(cacheKey);
   }
-});
+}
 
 app.get('/api/producao/:id', async (req, res) => {
   try {
