@@ -5,6 +5,7 @@ require('dotenv').config();
 const crypto = require('crypto');
 const webpush = require('web-push');
 const express = require('express');
+const compression = require('compression');
 const cors = require('cors');
 const { testConnection, dbPool } = require('./db');
 const { startSync, getSyncStats, runSync } = require('./sync');
@@ -19,6 +20,21 @@ const PORT = Number(process.env.PORT) || 3001;
 // OPENAI_API_KEY=sua-chave-da-openai
 const OPENAI_API_KEY = (process.env.OPENAI_API_KEY || '').trim();
 const OPENAI_MODEL = (process.env.OPENAI_MODEL || 'gpt-4.1-mini').trim();
+
+// Compressão gzip.
+// Medido em 05/10/2026: o edge do Railway já devolve Content-Encoding: gzip
+// mesmo sem este middleware, então na borda o ganho é zero. Isto existe para o
+// trecho container -> edge, que não dá para medir de fora: se o Railway contar
+// egress ali, sem isto estaríamos pagando o JSON cru. O próprio compression
+// não comprime duas vezes — ele desiste quando Content-Encoding já está posto.
+app.use(compression({
+  threshold: 1024,
+  filter: (req, res) => {
+    if (res.getHeader('Content-Encoding')) return false;
+    if (req.headers['x-no-compression']) return false;
+    return compression.filter(req, res);
+  }
+}));
 
 app.use(express.json({ limit: '2mb' }));
 app.use(express.urlencoded({ extended: false }));
@@ -63,10 +79,25 @@ const corsOptions = {
   },
   credentials: true,
   methods: ['GET', 'PATCH', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key']
+  // If-None-Match/If-Modified-Since: o frontend roda em outra origem, então sem
+  // liberar esses dois no preflight o navegador recusa a revalidação.
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-API-Key', 'If-None-Match', 'If-Modified-Since'],
+  // ETag só é legível pelo JS de outra origem se for exposto aqui. Sem isto o
+  // frontend não consegue guardar o ETag e todo ciclo rebaixa o payload inteiro.
+  exposedHeaders: ['ETag', 'Cache-Control']
 };
 
 app.use(cors(corsOptions));
+
+// Leituras de /api são dado vivo: "no-cache" não proíbe guardar, obriga a
+// revalidar. Com o ETag que o Express já emite, uma revalidação sem mudança
+// volta 304 sem corpo. Antes não havia Cache-Control nenhum, e aí o navegador
+// decidia por heurística — podia tanto gastar banda à toa quanto servir velho.
+app.use('/api', (req, res, next) => {
+  if (req.method === 'GET') res.set('Cache-Control', 'no-cache');
+  next();
+});
+
 function sendError(res, status, message, detail) {
   return res.status(status).json({
     ok: false,
