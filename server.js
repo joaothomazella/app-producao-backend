@@ -5672,6 +5672,275 @@ app.get('/api/producao/litragem-setor', async (req, res) => {
 
 
 // ===================================================
+// INDICADOR DE PRAZO DE ENTREGA
+// GET /api/producao/prazo-entrega?inicio=&fim=&detalhe=1
+//
+// Fica sob /api/producao/ e não sob /api/pedidos/ por um motivo prático: já
+// existe GET /api/pedidos/:numero registrado na linha 3715, e no Express a
+// primeira rota que casa é a que atende — /api/pedidos/prazo seria lido como o
+// pedido de número "prazo". Aqui não há conflito, porque GET /api/producao/:id
+// só vem depois (linha ~6530), que é também o motivo de os outros relatórios
+// morarem neste mesmo trecho do arquivo.
+//
+// Mede, por pedido, quantos dias existem entre a entrada e a data de entrega:
+// 4 dias ou mais = ideal, 3 dias ou menos = crítico.
+//
+// Três decisões que vale registrar, todas medidas no banco em 06/10/2026:
+//
+// 1) Data de entrada = producao_lotes.data_criacao (o primeiro lote do pedido).
+//    Cobertura de 2441 em 2441 lotes. É o único campo com 100%.
+//
+// 2) Data de entrega, na ordem: o que o calendário gravou em ff_pedidos_datas,
+//    depois a previsão do ERP em cli_pedidos_itens.pits_previsao (4058/4058),
+//    e por último producao_lotes.previsao_entrega — que só serve para pedidos
+//    MANUAL-, pois tem apenas 676 de 2441. A leitura do override é AO VIVO, de
+//    propósito: mexer na data pelo calendário reflete aqui na hora, sem cópia
+//    paralela para sair de sincronia. Hoje são 78 overrides, 661 datas do ERP
+//    e 7 do próprio lote.
+//
+// 3) Base não entra. O corte é por producao_lotes.tipo_lote = 'base' (279
+//    lotes), não pelo nome do produto: só 3 de 4058 itens do ERP têm nome
+//    começando com "BASE", então filtrar por nome não excluiria quase nada.
+//    133 pedidos são só de base e desaparecem inteiros da conta.
+//
+// Por que três consultas em vez de um JOIN: medido, o JOIN de producao_lotes
+// com cli_pedidos_itens via pits_numero leva ~4 s (não há índice nessa coluna)
+// e estas três levam ~600 ms, com resultado idêntico nos 746 pedidos.
+// ===================================================
+
+const PRAZO_IDEAL_MINIMO_DIAS = 4;   // >= 4 dias  -> ideal
+const PRAZO_LIMITE_MIN = '2020-01-01';
+const PRAZO_LIMITE_MAX = '2030-12-31';
+// Acima disso não é prazo de produção, é erro de ano digitado ou projeto
+// especial. Hoje pega exatamente 1 pedido (026290, entrega marcada para
+// 2029-09-28), e esse único pedido sozinho levava a média geral de 5,03 para
+// 6,53 dias. Ele continua contado no percentual — é ideal de qualquer jeito —
+// mas a média sai também sem ele, para a tela poder mostrar a verdadeira.
+const PRAZO_FORA_DE_CURVA_DIAS = 60;
+
+// Converte Date ou string em 'YYYY-MM-DD' sem passar por UTC (o banco guarda
+// data local; usar toISOString direto jogaria tudo um dia para trás).
+function przData(valor) {
+  if (!valor) return null;
+  if (valor instanceof Date) {
+    if (Number.isNaN(valor.getTime())) return null;
+    const local = new Date(valor.getTime() - valor.getTimezoneOffset() * 60000);
+    return local.toISOString().slice(0, 10);
+  }
+  const s = String(valor).slice(0, 10);
+  return /^\d{4}-\d{2}-\d{2}$/.test(s) ? s : null;
+}
+
+function przDiasEntre(de, ate) {
+  return Math.round((Date.parse(`${ate}T00:00:00Z`) - Date.parse(`${de}T00:00:00Z`)) / 86400000);
+}
+
+function przMediana(valores) {
+  if (!valores.length) return 0;
+  const v = [...valores].sort((a, b) => a - b);
+  const meio = Math.floor(v.length / 2);
+  return v.length % 2 ? v[meio] : lsRound((v[meio - 1] + v[meio]) / 2);
+}
+
+app.get('/api/producao/prazo-entrega', async (req, res) => {
+  try {
+    const inicio = przData((req.query.inicio || '').trim());
+    const fim = przData((req.query.fim || '').trim());
+    const incluirDetalhe = String(req.query.detalhe || '') === '1';
+
+    const [loteRows, itemRows, overrideRows] = await Promise.all([
+      dbPool.query(`
+        SELECT TRIM(numero_pedido) AS pedido,
+               DATE(MIN(data_criacao)) AS entrada,
+               MIN(previsao_entrega) AS previsao_lote,
+               COUNT(DISTINCT op) AS ops,
+               MAX(cliente_nome) AS cliente
+        FROM producao_lotes
+        WHERE LOWER(TRIM(COALESCE(tipo_lote, ''))) <> 'base'
+          AND data_criacao IS NOT NULL
+          AND numero_pedido IS NOT NULL AND TRIM(numero_pedido) <> ''
+        GROUP BY TRIM(numero_pedido)
+      `).then(r => r[0]),
+      dbPool.query(`
+        SELECT TRIM(pits_numero) AS pedido, MIN(pits_previsao) AS previsao
+        FROM cli_pedidos_itens
+        WHERE pits_previsao IS NOT NULL AND TRIM(COALESCE(pits_numero, '')) <> ''
+        GROUP BY TRIM(pits_numero)
+      `).then(r => r[0]),
+      dbPool.query(`
+        SELECT TRIM(pedido) AS pedido, MAX(data_entrega) AS data_entrega
+        FROM ff_pedidos_datas
+        WHERE data_entrega IS NOT NULL AND TRIM(COALESCE(pedido, '')) <> ''
+        GROUP BY TRIM(pedido)
+      `).then(r => r[0])
+    ]);
+
+    const previsaoErp = new Map();
+    for (const r of itemRows) {
+      const d = przData(r.previsao);
+      if (d) previsaoErp.set(r.pedido, d);
+    }
+    const previsaoCalendario = new Map();
+    for (const r of overrideRows) {
+      const d = przData(r.data_entrega);
+      if (d) previsaoCalendario.set(r.pedido, d);
+    }
+
+    const pedidos = [];
+    const descartados = { sem_data_entrega: 0, data_fora_da_faixa: 0, sem_data_entrada: 0 };
+
+    for (const l of loteRows) {
+      const entrada = przData(l.entrada);
+      if (!entrada) { descartados.sem_data_entrada++; continue; }
+      if (inicio && entrada < inicio) continue;
+      if (fim && entrada > fim) continue;
+
+      const doCalendario = previsaoCalendario.get(l.pedido) || null;
+      const doErp = previsaoErp.get(l.pedido) || null;
+      const doLote = przData(l.previsao_lote);
+      const entrega = doCalendario || doErp || doLote;
+
+      if (!entrega) { descartados.sem_data_entrega++; continue; }
+      // Há datas digitadas errado no ERP (um pedido com previsão no ano 0226).
+      // Elas ficam de fora da conta em vez de serem corrigidas aqui — mexer em
+      // dado do ERP é outra conversa.
+      if (entrega < PRAZO_LIMITE_MIN || entrega > PRAZO_LIMITE_MAX) { descartados.data_fora_da_faixa++; continue; }
+
+      const dias = przDiasEntre(entrada, entrega);
+      pedidos.push({
+        pedido: l.pedido,
+        cliente: l.cliente || '',
+        entrada,
+        entrega,
+        dias,
+        ops: Number(l.ops) || 0,
+        // Prazo negativo = entrega marcada antes da entrada. Hoje são 17 casos,
+        // todos de maio/2026, quando os lotes foram carregados em massa para
+        // trás (114 num dia, 116 em outro). Não é atraso, é artefato de carga:
+        // fica visível e identificado, mas fora do percentual.
+        prazo_invalido: dias < 0,
+        fora_de_curva: dias > PRAZO_FORA_DE_CURVA_DIAS,
+        classificacao: dias < 0 ? 'invalido' : (dias >= PRAZO_IDEAL_MINIMO_DIAS ? 'ideal' : 'critico'),
+        origem_data_entrega: doCalendario ? 'calendario' : (doErp ? 'erp' : 'lote'),
+        data_alterada_no_calendario: Boolean(doCalendario)
+      });
+    }
+
+    pedidos.sort((a, b) => (a.entrada < b.entrada ? 1 : a.entrada > b.entrada ? -1 : 0));
+
+    const validos = pedidos.filter(p => !p.prazo_invalido);
+    const ideal = validos.filter(p => p.classificacao === 'ideal');
+    const critico = validos.filter(p => p.classificacao === 'critico');
+    const listaDias = validos.map(p => p.dias);
+    const foraDeCurva = validos.filter(p => p.fora_de_curva);
+    const diasSemForaDeCurva = validos.filter(p => !p.fora_de_curva).map(p => p.dias);
+
+    const distribuicaoMap = new Map();
+    for (const p of validos) distribuicaoMap.set(p.dias, (distribuicaoMap.get(p.dias) || 0) + 1);
+    const distribuicao = [...distribuicaoMap.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([dias, qtd]) => ({
+        dias,
+        pedidos: qtd,
+        classificacao: dias >= PRAZO_IDEAL_MINIMO_DIAS ? 'ideal' : 'critico'
+      }));
+
+    const mensalMap = new Map();
+    for (const p of pedidos) {
+      const mes = p.entrada.slice(0, 7);
+      if (!mensalMap.has(mes)) mensalMap.set(mes, { mes, pedidos: 0, ideal: 0, critico: 0, invalidos: 0, fora_de_curva: 0, soma_dias: 0, soma_dias_limpa: 0, qtd_limpa: 0 });
+      const m = mensalMap.get(mes);
+      if (p.prazo_invalido) { m.invalidos++; continue; }
+      m.pedidos++;
+      m.soma_dias += p.dias;
+      if (p.fora_de_curva) m.fora_de_curva++;
+      else { m.soma_dias_limpa += p.dias; m.qtd_limpa++; }
+      if (p.classificacao === 'ideal') m.ideal++; else m.critico++;
+    }
+    const mensal = [...mensalMap.values()]
+      .sort((a, b) => (a.mes < b.mes ? -1 : 1))
+      .map(m => ({
+        mes: m.mes,
+        pedidos: m.pedidos,
+        ideal: m.ideal,
+        critico: m.critico,
+        invalidos: m.invalidos,
+        fora_de_curva: m.fora_de_curva,
+        percentual_ideal: m.pedidos ? lsRound((m.ideal / m.pedidos) * 100) : 0,
+        media_dias: m.pedidos ? lsRound(m.soma_dias / m.pedidos) : 0,
+        media_dias_sem_fora_de_curva: m.qtd_limpa ? lsRound(m.soma_dias_limpa / m.qtd_limpa) : 0
+      }));
+
+    const porOrigem = { calendario: 0, erp: 0, lote: 0 };
+    for (const p of pedidos) porOrigem[p.origem_data_entrega]++;
+
+    const avisos = [];
+    const invalidos = pedidos.length - validos.length;
+    if (invalidos > 0) {
+      avisos.push(`${invalidos} pedido(s) com data de entrega anterior à entrada ficaram fora do percentual. ` +
+                  `São resquícios da carga inicial de lotes antigos, não atrasos.`);
+    }
+    if (foraDeCurva.length > 0) {
+      avisos.push(`${foraDeCurva.length} pedido(s) com prazo acima de ${PRAZO_FORA_DE_CURVA_DIAS} dias ` +
+                  `(${foraDeCurva.map(p => `${p.pedido}: ${p.dias}d`).join(', ')}) entram no percentual, ` +
+                  `mas distorcem a média — use "média sem fora de curva".`);
+    }
+    if (descartados.sem_data_entrega > 0) {
+      avisos.push(`${descartados.sem_data_entrega} pedido(s) sem nenhuma data de entrega (nem calendário, nem ERP) não entraram na conta.`);
+    }
+    if (descartados.data_fora_da_faixa > 0) {
+      avisos.push(`${descartados.data_fora_da_faixa} pedido(s) com data de entrega fora da faixa ${PRAZO_LIMITE_MIN}..${PRAZO_LIMITE_MAX} ` +
+                  `foram ignorados (erro de digitação de ano no ERP).`);
+    }
+
+    return res.json({
+      ok: true,
+      criterio: {
+        ideal: `${PRAZO_IDEAL_MINIMO_DIAS} dias ou mais entre a entrada do pedido e a data de entrega`,
+        critico: `${PRAZO_IDEAL_MINIMO_DIAS - 1} dias ou menos`,
+        ideal_minimo_dias: PRAZO_IDEAL_MINIMO_DIAS,
+        base_excluida: true,
+        data_entrega: 'calendário (ff_pedidos_datas) > previsão do ERP > previsão do lote'
+      },
+      periodo: { inicio: inicio || null, fim: fim || null },
+      resumo: {
+        pedidos: validos.length,
+        ideal: ideal.length,
+        critico: critico.length,
+        percentual_ideal: validos.length ? lsRound((ideal.length / validos.length) * 100) : 0,
+        percentual_critico: validos.length ? lsRound((critico.length / validos.length) * 100) : 0,
+        media_dias: validos.length ? lsRound(listaDias.reduce((a, b) => a + b, 0) / validos.length) : 0,
+        // A média honesta para a tela: sem os prazos absurdos. A mediana já é
+        // naturalmente imune a eles, então serve de conferência.
+        media_dias_sem_fora_de_curva: diasSemForaDeCurva.length
+          ? lsRound(diasSemForaDeCurva.reduce((a, b) => a + b, 0) / diasSemForaDeCurva.length) : 0,
+        mediana_dias: przMediana(listaDias),
+        menor_prazo_dias: validos.length ? Math.min(...listaDias) : 0,
+        maior_prazo_dias: validos.length ? Math.max(...listaDias) : 0,
+        pedidos_fora_do_calculo: invalidos,
+        pedidos_fora_de_curva: foraDeCurva.length,
+        datas_vindas_do_calendario: porOrigem.calendario
+      },
+      fora_de_curva: foraDeCurva.map(p => ({ pedido: p.pedido, cliente: p.cliente, entrada: p.entrada, entrega: p.entrega, dias: p.dias })),
+      distribuicao,
+      mensal,
+      origem_data_entrega: porOrigem,
+      descartados,
+      avisos,
+      // A lista completa só vai quando pedida: são centenas de linhas e a tela
+      // normalmente só precisa dos agregados.
+      pedidos: incluirDetalhe ? pedidos : pedidos.slice(0, 50),
+      pedidos_truncados: !incluirDetalhe && pedidos.length > 50,
+      total_pedidos: pedidos.length
+    });
+  } catch (err) {
+    console.error('GET /api/producao/prazo-entrega erro:', err.message);
+    return sendError(res, 500, 'Erro ao gerar indicador de prazo de entrega', err.message);
+  }
+});
+
+
+// ===================================================
 // PATCH INDUSCOLOR – REPROCESSAMENTO SEGURO DOS TEMPOS ANTIGOS
 // Cole este bloco no server.js, de preferência logo depois da rota:
 // GET /api/producao/relatorio-tempos
