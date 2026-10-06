@@ -186,6 +186,36 @@ async function saveLastImportedId(id) {
 }
 
 // =========================
+// Número da OP: formato canônico de 6 dígitos
+// =========================
+//
+// A OP tem 6 dígitos ("089989"). O ERP sempre manda nesse formato — conferido em
+// 06/10/2026: os 4058 itens de cli_pedidos_itens têm pits_op com exatamente 6
+// caracteres. Quem gerava OP curta era a criação manual de lote, onde a pessoa
+// digita o número e o zero da frente se perde (medido: 5 lotes, todos de pedidos
+// MANUAL-; ex.: "89989" em vez de "089989"). Uma OP sem o zero não casa com a
+// mesma OP escrita certo, então ela escapa da trava de duplicidade, aparece
+// errada na tela e não bate em busca nenhuma.
+//
+// Regra, deliberadamente conservadora:
+//  - tira ponto e espaço ("087.501" -> "087501"), que é como o número às vezes é
+//    copiado do ERP (3 lotes antigos no banco estão assim);
+//  - se o que sobrou NÃO for só dígito, devolve o original intacto. Nunca invento
+//    um número em cima de uma OP que eu não entendi;
+//  - com 6 dígitos ou mais, devolve como está — nunca trunca;
+//  - com menos de 6, completa com zeros à esquerda.
+function normalizeOpNumero(valor) {
+  const bruto = String(valor ?? '').trim();
+  if (!bruto) return '';
+
+  const limpo = bruto.replace(/[.\s]/g, '');
+  if (!/^\d+$/.test(limpo)) return bruto;
+  if (limpo.length >= 6) return limpo;
+
+  return limpo.padStart(6, '0');
+}
+
+// =========================
 // Sync principal
 // =========================
 
@@ -265,7 +295,7 @@ async function runSync() {
       [
         row.origem_item_id,
         row.numero_pedido || '',
-        row.op || '',
+        normalizeOpNumero(row.op),
         row.produto_codigo || '',
         row.produto_nome || '',
         row.quantidade || 0,
@@ -382,4 +412,5 @@ module.exports = {
   startSync,
   getSyncStats,
   setOnLotsChanged,
+  normalizeOpNumero,
 };

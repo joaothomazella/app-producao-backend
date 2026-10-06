@@ -8,7 +8,7 @@ const express = require('express');
 const compression = require('compression');
 const cors = require('cors');
 const { testConnection, dbPool } = require('./db');
-const { startSync, getSyncStats, runSync, setOnLotsChanged } = require('./sync');
+const { startSync, getSyncStats, runSync, setOnLotsChanged, normalizeOpNumero } = require('./sync');
 
 const app = express();
 const PORT = Number(process.env.PORT) || 3001;
@@ -3997,7 +3997,12 @@ async function criarLoteManual(req, res) {
 
     const body = req.body || {};
     const numeroPedido = String(body.numero_pedido || body.pedido || body.numero || '').trim();
-    const op = String(body.op || body.pits_op || '').trim();
+    // A OP entra sempre no formato canônico de 6 dígitos (089989, nunca 89989).
+    // Era aqui que o zero da frente se perdia: a pessoa digita o número no
+    // formulário e o que for digitado vai direto para o banco. Ver
+    // normalizeOpNumero em sync.js para a regra e o porquê de cada caso.
+    const opDigitada = String(body.op || body.pits_op || '').trim();
+    const op = normalizeOpNumero(opDigitada);
     const produtoCodigo = String(body.produto_codigo || body.codigo_produto || body.pits_produto || '').trim();
     const produtoNome = String(body.produto_nome || body.nome_produto || body.pits_nome_produto || '').trim();
     const clienteCodigo = String(body.cliente_codigo || body.codigo_cliente || body.pits_cliente || '').trim();
@@ -4030,9 +4035,13 @@ async function criarLoteManual(req, res) {
     if (!op) return sendError(res, 400, 'Informe a OP/lote');
     if (!produtoNome && !produtoCodigo) return sendError(res, 400, 'Informe o produto');
 
+    // Confere as duas grafias: a canônica e a que a pessoa digitou. Sem isso,
+    // criar "089989" passaria batido por um lote antigo gravado como "89989"
+    // (restam 4 no banco, todos de antes desta normalização) e nasceriam dois
+    // lotes para a mesma OP.
     const [duplicados] = await dbPool.query(
-      `SELECT id FROM producao_lotes WHERE TRIM(op) = TRIM(?) LIMIT 1`,
-      [op]
+      `SELECT id, op FROM producao_lotes WHERE TRIM(op) IN (TRIM(?), TRIM(?)) LIMIT 1`,
+      [op, opDigitada]
     );
 
     if (duplicados.length) {
@@ -4040,7 +4049,7 @@ async function criarLoteManual(req, res) {
         res,
         409,
         'Já existe um lote com essa OP em produção',
-        `Lote existente ID ${duplicados[0].id}`
+        `Lote existente ID ${duplicados[0].id} (OP ${duplicados[0].op})`
       );
     }
 
