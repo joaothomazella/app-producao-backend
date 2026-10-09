@@ -5735,6 +5735,119 @@ function przDiasEntre(de, ate) {
   return Math.round((Date.parse(`${ate}T00:00:00Z`) - Date.parse(`${de}T00:00:00Z`)) / 86400000);
 }
 
+// ---------------------------------------------------------------------------
+// DIAS NÃO ÚTEIS
+//
+// Sábado, domingo e feriado não entram no prazo, porque não se produz neles.
+//
+// Sobre sábado e domingo, medido no banco em 06/10/2026 (não suposto):
+//   - nenhum lote foi criado num sábado ou domingo: 0 de 46 fins de semana
+//   - nenhuma data de entrega cai num sábado; 1 cai num domingo
+//   - de 46 dias de fim de semana, só 1 teve movimentação (sábado 26/09, com
+//     67 eventos contra a média de 176 de um dia útil — foi um turno extra
+//     isolado, não rotina)
+//
+// Sobre os feriados: o sistema não tem tabela de feriado nenhuma, então a
+// lista vive aqui. Ela não foi copiada de calendário: cruzei três sinais
+// independentes por dia (eventos de abre/fecha expediente, movimentação dentro
+// do ff_history e criação de lote) e procurei os dias de semana com os três em
+// ZERO. Deram exatamente estes, e todos conferem com o calendário:
+//
+//   2026-05-01 sex  Dia do Trabalho
+//   2026-06-04 qui  Corpus Christi
+//   2026-06-05 sex  emenda de Corpus Christi   <- a fábrica emenda
+//   2026-07-09 qui  Revolução Constitucionalista (feriado estadual de SP)
+//   2026-07-10 sex  emenda de 9 de julho       <- a fábrica emenda
+//   2026-09-07 seg  Independência
+//
+// (A semana de 04 a 08/05/2026 também deu zero, mas não é feriado: é anterior
+// à entrada do sistema em operação, cuja primeira carga foi em 11/05.)
+//
+// As datas de 2026 a partir de outubro e todas as de 2027 ainda não podem ser
+// confirmadas pelos dados — são o calendário nacional e o estadual de SP, com
+// o dia da semana de cada uma verificado um por um.
+//
+// PARA ATUALIZAR: acrescente a data aqui no formato 'AAAA-MM-DD'. Feriado que
+// cai em fim de semana pode ficar na lista sem problema, não muda nada. A tela
+// mostra quais feriados foram aplicados no período consultado, justamente para
+// que um erro aqui apareça em vez de ficar escondido.
+// ---------------------------------------------------------------------------
+const PRAZO_FERIADOS = {
+  '2026-01-01': 'Confraternização Universal',
+  '2026-02-16': 'Carnaval',
+  '2026-02-17': 'Carnaval',
+  '2026-04-03': 'Sexta-feira Santa',
+  '2026-04-21': 'Tiradentes',
+  '2026-05-01': 'Dia do Trabalho',
+  '2026-06-04': 'Corpus Christi',
+  '2026-06-05': 'Emenda de Corpus Christi',
+  '2026-07-09': 'Revolução Constitucionalista (SP)',
+  '2026-07-10': 'Emenda de 9 de julho',
+  '2026-09-07': 'Independência',
+  '2026-10-12': 'Nossa Senhora Aparecida',
+  '2026-11-02': 'Finados',
+  '2026-11-15': 'Proclamação da República',
+  '2026-11-20': 'Consciência Negra',
+  '2026-12-25': 'Natal',
+  '2027-01-01': 'Confraternização Universal',
+  '2027-02-08': 'Carnaval',
+  '2027-02-09': 'Carnaval',
+  '2027-03-26': 'Sexta-feira Santa',
+  '2027-04-21': 'Tiradentes',
+  '2027-05-01': 'Dia do Trabalho',
+  '2027-05-27': 'Corpus Christi',
+  // Inferida dos dois casos observados em 2026, em que a fábrica emendou a
+  // sexta depois de um feriado de quinta. Se em 2027 não emendar, tire daqui.
+  '2027-05-28': 'Emenda de Corpus Christi',
+  '2027-07-09': 'Revolução Constitucionalista (SP)',
+  '2027-09-07': 'Independência',
+  '2027-10-12': 'Nossa Senhora Aparecida',
+  '2027-11-02': 'Finados',
+  '2027-11-15': 'Proclamação da República',
+  '2027-11-20': 'Consciência Negra',
+  '2027-12-25': 'Natal'
+};
+
+function przDiaDaSemana(iso) {
+  return new Date(`${iso}T12:00:00Z`).getUTCDay();   // 0 = domingo, 6 = sábado
+}
+
+function przEhDiaUtil(iso) {
+  const d = przDiaDaSemana(iso);
+  if (d === 0 || d === 6) return false;
+  return !PRAZO_FERIADOS[iso];
+}
+
+// Dias ÚTEIS no intervalo (entrada, entrega]: conta o dia da entrega e não
+// conta o da entrada. Com isso:
+//   - entrada e entrega no mesmo dia dá 0, igual ao cálculo em dias corridos
+//   - segunda a sexta dá 4, exatamente como antes (a semana cheia não muda)
+//   - quinta a segunda dá 2 e não 4, que é o ponto: o fim de semana no meio
+//     não é tempo de produção
+// Entrega anterior à entrada devolve negativo, para esses pedidos continuarem
+// identificáveis em vez de virarem zero.
+function przDiasUteis(de, ate) {
+  const sinal = ate < de ? -1 : 1;
+  const [ini, fim] = sinal > 0 ? [de, ate] : [ate, de];
+  let n = 0;
+  const limite = Date.parse(`${fim}T12:00:00Z`);
+  for (let t = Date.parse(`${ini}T12:00:00Z`) + 86400000; t <= limite; t += 86400000) {
+    if (przEhDiaUtil(new Date(t).toISOString().slice(0, 10))) n++;
+  }
+  return sinal * n;
+}
+
+// Os feriados que caíram dentro do período consultado e de fato tiraram dia
+// útil da conta. Vai para a tela, para a lista acima poder ser auditada.
+function przFeriadosNoPeriodo(deISO, ateISO) {
+  if (!deISO || !ateISO || ateISO < deISO) return [];
+  return Object.entries(PRAZO_FERIADOS)
+    .filter(([iso]) => iso >= deISO && iso <= ateISO)
+    .filter(([iso]) => { const d = przDiaDaSemana(iso); return d !== 0 && d !== 6; })
+    .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+    .map(([data, nome]) => ({ data, nome, dia_da_semana: ['domingo', 'segunda', 'terça', 'quarta', 'quinta', 'sexta', 'sábado'][przDiaDaSemana(data)] }));
+}
+
 function przMediana(valores) {
   if (!valores.length) return 0;
   const v = [...valores].sort((a, b) => a - b);
@@ -5806,13 +5919,19 @@ app.get('/api/producao/prazo-entrega', async (req, res) => {
       // dado do ERP é outra conversa.
       if (entrega < PRAZO_LIMITE_MIN || entrega > PRAZO_LIMITE_MAX) { descartados.data_fora_da_faixa++; continue; }
 
-      const dias = przDiasEntre(entrada, entrega);
+      // O prazo agora é contado em dias ÚTEIS: fim de semana e feriado não
+      // são tempo de produção. O valor em dias corridos continua junto para
+      // a tela mostrar os dois e a conta poder ser conferida a olho.
+      const diasCorridos = przDiasEntre(entrada, entrega);
+      const dias = przDiasUteis(entrada, entrega);
       pedidos.push({
         pedido: l.pedido,
         cliente: l.cliente || '',
         entrada,
         entrega,
         dias,
+        dias_corridos: diasCorridos,
+        dias_nao_uteis: diasCorridos - dias,
         ops: Number(l.ops) || 0,
         // Prazo negativo = entrega marcada antes da entrada. Hoje são 17 casos,
         // todos de maio/2026, quando os lotes foram carregados em massa para
@@ -5896,12 +6015,24 @@ app.get('/api/producao/prazo-entrega', async (req, res) => {
     return res.json({
       ok: true,
       criterio: {
-        ideal: `${PRAZO_IDEAL_MINIMO_DIAS} dias ou mais entre a entrada do pedido e a data de entrega`,
-        critico: `${PRAZO_IDEAL_MINIMO_DIAS - 1} dias ou menos`,
+        ideal: `${PRAZO_IDEAL_MINIMO_DIAS} dias úteis ou mais entre a entrada do pedido e a data de entrega`,
+        critico: `${PRAZO_IDEAL_MINIMO_DIAS - 1} dias úteis ou menos`,
         ideal_minimo_dias: PRAZO_IDEAL_MINIMO_DIAS,
+        unidade: 'dias úteis',
+        dias_nao_uteis: 'sábado, domingo e feriado não entram na conta, porque não se produz neles',
+        contagem: 'conta o dia da entrega e não conta o da entrada',
         base_excluida: true,
         data_entrega: 'calendário (ff_pedidos_datas) > previsão do ERP > previsão do lote'
       },
+      // Os feriados que de fato tiraram dia útil da conta neste período. Vão
+      // para a tela de propósito: um erro na lista aparece em vez de ficar
+      // escondido dentro do número.
+      feriados_aplicados: (() => {
+        if (!validos.length) return [];
+        const de = validos.reduce((a, p) => (p.entrada < a ? p.entrada : a), validos[0].entrada);
+        const ate = validos.reduce((a, p) => (p.entrega > a ? p.entrega : a), validos[0].entrega);
+        return przFeriadosNoPeriodo(de, ate);
+      })(),
       periodo: { inicio: inicio || null, fim: fim || null },
       resumo: {
         pedidos: validos.length,
