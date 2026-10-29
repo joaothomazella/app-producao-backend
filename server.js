@@ -2176,6 +2176,7 @@ app.get('/', (req, res) => {
       'GET /api/expediente',
       'GET /api/expediente/:setor',
       'POST /api/expediente/toggle',
+      'POST /api/expediente/encerrar-geral',
       'GET /api/cq/lotes/:op',
       'GET /api/cq/lote-resumo/:op',
       'POST /api/cq/analises',
@@ -6986,6 +6987,129 @@ app.post('/api/expediente/toggle', async (req, res) => {
   } catch (err) {
     console.error('POST /api/expediente/toggle erro:', err.message);
     sendError(res, 500, 'Erro ao alterar expediente do setor', err.message);
+  }
+});
+
+// Encerra o expediente de TODOS os setores que estiverem abertos.
+//
+// Serve para o fim do dia, quando alguem esqueceu de fechar o setor dele: se
+// o expediente fica aberto, o tempo dos lotes continua contando a noite toda
+// e o Relatorio de Tempos sai errado.
+//
+// Regras, as mesmas do POST /api/expediente/toggle:
+//  - So mexe em setor que esta ABERTO. Setor ja fechado fica como esta -
+//    regravar finalizado_em apagaria a hora real em que ele fechou.
+//  - Grava um evento 'fechado' por setor em ff_sector_shift_events, porque e
+//    de cima desses eventos que o calculo de tempo util e feito. Sem o
+//    evento, o fechamento nao existe para o relatorio.
+//  - Respeita a trava por setor: setor com um toggle em andamento e deixado
+//    de fora e devolvido na lista de ignorados, em vez de disputar a gravacao.
+//  - Um UPDATE unico para todos, para que todos os setores fechem no MESMO
+//    instante. Fechar em horarios ligeiramente diferentes criaria diferenca
+//    de minutos entre setores sem motivo nenhum.
+app.post('/api/expediente/encerrar-geral', async (req, res) => {
+  const travados = [];
+  const alvos = [];
+
+  try {
+    await ensureSectorShiftTable();
+    await ensureSectorShiftEventsTable();
+    await ensurePedidoDatasTable();
+
+    const [abertosRows] = await dbPool.query(
+      `SELECT setor FROM ff_sector_shifts WHERE expediente_aberto = 1 ORDER BY setor ASC`
+    );
+
+    // Usa o setor exatamente como esta gravado: normalizar de novo aqui
+    // poderia apontar para uma chave que nao existe na tabela.
+    const abertos = abertosRows.map(r => String(r.setor || '')).filter(Boolean);
+
+    if (!abertos.length) {
+      return res.json({
+        ok: true,
+        unchanged: true,
+        total: 0,
+        fechados: [],
+        ignorados: [],
+        message: 'Nenhum setor estava com o expediente aberto.'
+      });
+    }
+
+    abertos.forEach(setor => {
+      if (ffExpedienteToggleLocks.has(setor)) travados.push(setor);
+      else alvos.push(setor);
+    });
+
+    if (!alvos.length) {
+      return sendError(
+        res,
+        409,
+        'Ha alteracoes de expediente em andamento nos setores abertos. Aguarde um instante e tente de novo.',
+        `Setores ocupados: ${travados.join(', ')}`
+      );
+    }
+
+    alvos.forEach(setor => ffExpedienteToggleLocks.add(setor));
+
+    const placeholders = alvos.map(() => '?').join(',');
+
+    // Um unico UPDATE: todos os setores recebem o mesmo finalizado_em.
+    // O "AND expediente_aberto = 1" e proposital - se alguem fechou um setor
+    // entre a leitura e aqui, aquele setor nao e tocado.
+    const [resultado] = await dbPool.query(
+      `
+        UPDATE ff_sector_shifts
+           SET expediente_aberto = 0,
+               finalizado_em = NOW()
+         WHERE expediente_aberto = 1
+           AND setor IN (${placeholders})
+      `,
+      alvos
+    );
+
+    const autor = req.user?.name || req.user?.email || req.authType || null;
+
+    // Um evento 'fechado' por setor, no mesmo formato que o toggle grava.
+    const valores = [];
+    alvos.forEach(setor => { valores.push(setor, 'fechado', autor); });
+    await dbPool.query(
+      `
+        INSERT INTO ff_sector_shift_events (setor, event_type, created_by)
+        VALUES ${alvos.map(() => '(?, ?, ?)').join(', ')}
+      `,
+      valores
+    );
+
+    const [rows] = await dbPool.query(
+      `
+        SELECT id, setor, expediente_aberto, iniciado_em, finalizado_em, atualizado_em
+          FROM ff_sector_shifts
+         WHERE setor IN (${placeholders})
+         ORDER BY setor ASC
+      `,
+      alvos
+    );
+
+    // Fechar expediente muda o tempo util de todo mundo: o mapa de expediente
+    // e os caches de lote precisam ser refeitos na proxima leitura.
+    _shiftMapCache = null;
+    _shiftMapCacheAt = 0;
+    ffInvalidateLotCaches();
+
+    console.log(`[expediente] encerramento geral por ${autor || 'desconhecido'}: ${alvos.length} setor(es) fechado(s)${travados.length ? `, ${travados.length} ignorado(s)` : ''}`);
+
+    res.json({
+      ok: true,
+      unchanged: false,
+      total: resultado?.affectedRows ?? alvos.length,
+      fechados: rows.map(ffFixShiftRowDates),
+      ignorados: travados
+    });
+  } catch (err) {
+    console.error('POST /api/expediente/encerrar-geral erro:', err.message);
+    sendError(res, 500, 'Erro ao encerrar o expediente geral', err.message);
+  } finally {
+    alvos.forEach(setor => ffExpedienteToggleLocks.delete(setor));
   }
 });
 
